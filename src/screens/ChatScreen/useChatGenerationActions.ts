@@ -8,7 +8,6 @@ import {
   intentClassifier,
   generationService,
   imageGenerationService,
-  onnxImageGeneratorService,
   ImageGenerationState,
   buildToolSystemPromptHint,
   contextCompactionService,
@@ -47,6 +46,7 @@ import {
   GenerationMeta,
 } from '../../types';
 import logger from '../../utils/logger';
+import { deleteChatImages, imagesNotDeletedAlert } from '../../services/chatImageCleanup';
 import { ModelReadyOutcome, ensureReadyOrAlert } from './modelReadiness';
 type SetState<T> = Dispatch<SetStateAction<T>>;
 const FALLBACK_RECENT_MESSAGE_COUNT = 2;
@@ -690,7 +690,7 @@ export async function startGenerationFn(
     !deps.activeModelInfo?.isRemote &&
     deps.activeModel &&
     !(await ensureReadyOrAlert(deps, 'startGeneration', () => {
-      startGenerationFn(deps, call);
+      void startGenerationFn(deps, call);
     }))
   ) {
     generationSession.end('not-ready');
@@ -847,7 +847,7 @@ export async function startGenerationFn(
       message:
         'The model returned nothing. This can happen when it runs on an incompatible backend (a K-quant on NPU/GPU falls back to CPU and may emit nothing). Try again, or switch the backend/model.',
       onRetry: () => {
-        startGenerationFn(deps, call);
+        void startGenerationFn(deps, call);
       },
     });
   }
@@ -1058,7 +1058,6 @@ export async function executeDeleteConversationFn(
     | 'activeConversationId'
     | 'isStreaming'
     | 'clearStreamingMessage'
-    | 'removeImagesByConversationId'
     | 'deleteConversation'
     | 'setActiveConversation'
     | 'navigation'
@@ -1073,11 +1072,16 @@ export async function executeDeleteConversationFn(
     await generationService.stopGeneration();
     deps.clearStreamingMessage();
   }
-  for (const id of deps.removeImagesByConversationId(deps.activeConversationId))
-    await onnxImageGeneratorService.deleteGeneratedImage(id);
+  // Files first; a record goes only once its file is gone (shared with the chats list).
+  const notDeleted = await deleteChatImages(deps.activeConversationId);
   contextCompactionService.clearSummary(deps.activeConversationId);
   deps.deleteConversation(deps.activeConversationId);
   deps.setActiveConversation(null);
+  if (notDeleted > 0) {
+    // Say so before leaving, or the user never learns some images stayed in the Gallery.
+    deps.setAlertState(imagesNotDeletedAlert(notDeleted, () => deps.navigation.goBack()));
+    return;
+  }
   deps.navigation.goBack();
 }
 export type RegenerateCall = {
@@ -1151,7 +1155,7 @@ export async function regenerateResponseFn(
     !deps.activeModelInfo?.isRemote &&
     deps.activeModel &&
     !(await ensureReadyOrAlert(deps, 'regenerate', () => {
-      regenerateResponseFn(deps, call);
+      void regenerateResponseFn(deps, call);
     }))
   ) {
     generationSession.end('not-ready');
