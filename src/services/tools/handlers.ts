@@ -46,6 +46,8 @@ async function dispatchTool(call: ToolCall): Promise<string> {
       if (!url) throw new Error('Missing required parameter: url');
       return handleReadUrl(url);
     }
+    case 'calendar':
+      return handleCalendar(call.arguments);
     default:
       throw new Error(`Unknown tool: ${call.name}`);
   }
@@ -387,4 +389,93 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
   return bytes < 1024 ** 3 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
+async function handleCalendar(args: Record<string, any>): Promise<string> {
+  const { CalendarService } = require('../calendar');
+  const action = args?.action;
+  if (!action) {
+    throw new Error(
+      "Missing required parameter: 'action' (must be one of: list, search, freebusy, create, update, delete, list_calendars)",
+    );
+  }
+
+  switch (action) {
+    case 'list': {
+      const res = await CalendarService.listEvents({
+        days: typeof args.days === 'number' ? args.days : undefined,
+        start: args.start,
+        end: args.end,
+        calendarName: args.calendar_name,
+      });
+      return JSON.stringify(res, null, 2);
+    }
+    case 'search': {
+      if (!args.query) {
+        throw new Error("Missing parameter: 'query' is required for search action.");
+      }
+      const res = await CalendarService.searchEvents({
+        query: args.query,
+        days: typeof args.days === 'number' ? args.days : undefined,
+      });
+      return JSON.stringify(res, null, 2);
+    }
+    case 'freebusy': {
+      const res = await CalendarService.freebusy({
+        days: typeof args.days === 'number' ? args.days : undefined,
+        start: args.start,
+        end: args.end,
+      });
+      return JSON.stringify(res, null, 2);
+    }
+    case 'create': {
+      if (!args.title) {
+        throw new Error("Missing parameter: 'title' is required for create action.");
+      }
+      const res = await CalendarService.createEvent({
+        title: args.title,
+        start: args.start,
+        end: args.end,
+        location: args.location,
+        notes: args.notes,
+        alarmMinutes:
+          typeof args.alarm_minutes === 'number' ? args.alarm_minutes : undefined,
+        calendarName: args.calendar_name,
+      });
+      return JSON.stringify(res, null, 2);
+    }
+    case 'update': {
+      if (!args.id) {
+        throw new Error("Missing parameter: 'id' is required for update action.");
+      }
+      const res = await CalendarService.updateEvent({
+        id: args.id,
+        title: args.title,
+        start: args.start,
+        end: args.end,
+        location: args.location,
+        notes: args.notes,
+        alarmMinutes:
+          typeof args.alarm_minutes === 'number' ? args.alarm_minutes : undefined,
+      });
+      return JSON.stringify(res, null, 2);
+    }
+    case 'delete': {
+      if (!args.id) {
+        throw new Error("Missing parameter: 'id' is required for delete action.");
+      }
+      const res = await CalendarService.deleteEvent({
+        id: args.id,
+      });
+      return JSON.stringify(res, null, 2);
+    }
+    case 'list_calendars': {
+      const res = await CalendarService.listCalendars();
+      return JSON.stringify({ count: res.length, calendars: res }, null, 2);
+    }
+    default:
+      throw new Error(
+        `Unsupported calendar action: ${action}. Valid actions: list, search, freebusy, create, update, delete, list_calendars`,
+      );
+  }
 }
