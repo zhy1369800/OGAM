@@ -3,10 +3,22 @@ name: Build Unsigned iOS IPA
 on:
   workflow_dispatch:
     inputs:
-      branch:
-        description: 'Branch or commit to build'
+      publish_release:
+        description: '发布到 GitHub Release'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release 标签（如 v0.1.0，留空则自动根据版本生成）'
+        type: string
         required: false
-        default: 'main'
+        default: ''
+      prerelease:
+        description: '是否标记为预发布 (Pre-release)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
 
 jobs:
   build-ipa:
@@ -17,7 +29,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
           submodules: false
           fetch-depth: 1
 
@@ -83,3 +94,32 @@ jobs:
           name: OffgridMobile-v${{ env.VERSION }}-unsigned-ipa
           path: build/OffgridMobile-v${{ env.VERSION }}-unsigned.ipa
           retention-days: 14
+
+      - name: Publish to GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_TAG="${{ inputs.release_tag }}"
+          if [ -z "$TARGET_TAG" ]; then
+            TARGET_TAG="v${{ env.VERSION }}"
+          fi
+
+          echo "Target Release Tag: $TARGET_TAG"
+          IPA_PATH="build/OffgridMobile-v${{ env.VERSION }}-unsigned.ipa"
+
+          PRERELEASE_FLAG=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            echo "Release $TARGET_TAG already exists, uploading IPA..."
+            gh release upload "$TARGET_TAG" "$IPA_PATH" --clobber
+          else
+            echo "Creating new release $TARGET_TAG..."
+            gh release create "$TARGET_TAG" "$IPA_PATH" \
+              --title "$TARGET_TAG" \
+              --notes "Unsigned iOS IPA build ($TARGET_TAG)" \
+              $PRERELEASE_FLAG
+          fi
