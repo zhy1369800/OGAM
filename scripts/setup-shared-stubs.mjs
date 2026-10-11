@@ -40,8 +40,13 @@ const target = {
   toolResultCharBudget: () => 4000,
 };
 
+target.__esModule = true;
+target.default = target;
+
 module.exports = new Proxy(target, {
   get(t, prop) {
+    if (prop === '__esModule') return true;
+    if (prop === 'default') return t;
     if (prop in t) return t[prop];
     return () => null;
   }
@@ -82,8 +87,24 @@ const target = {
   TOOL_CALL_OPENERS: ['<tool_call>', '<|tool_call|>', '<function='],
   XML_TOOL_CALL_FUNCTION_MARKER: 'function=',
   maxPartialTagSuffix: () => '',
-  parseChatModelOutput: (o) => ({ thinking: null, response: o || '' }),
-  parseChatThinkingContent: (c) => ({ thinking: null, response: c || '' }),
+  parseChatModelOutput: (content, reasoningContent) => ({
+    reasoning: reasoningContent || null,
+    thinking: reasoningContent || null,
+    answer: content || '',
+    response: content || '',
+    isReasoningComplete: true,
+    isThinkingComplete: true,
+    reasoningLabel: undefined,
+  }),
+  parseChatThinkingContent: (content) => ({
+    reasoning: null,
+    thinking: null,
+    answer: content || '',
+    response: content || '',
+    isReasoningComplete: true,
+    isThinkingComplete: true,
+    reasoningLabel: undefined,
+  }),
   partialTagSuffix: () => null,
   stripChatControlTokens: (t) => t || '',
   // Stream & Chat Previews
@@ -93,7 +114,13 @@ const target = {
   chatStreamPreviewHasMessageBody: () => false,
   isRuntimeOnlyMessage: () => false,
   isSupportingChatContext: () => false,
-  splitInlineReasoning: (text) => ({ thinking: null, content: text || '' }),
+  splitInlineReasoning: (text) => ({
+    reasoning: null,
+    thinking: null,
+    answer: text || '',
+    content: text || '',
+    reasoningLabel: undefined,
+  }),
   completeChatStreamTool: () => {},
   startChatStreamTool: () => {},
   serializeSyncedMessageContext: () => '',
@@ -134,8 +161,13 @@ const target = {
   TransportBridge: class {},
 };
 
+target.__esModule = true;
+target.default = target;
+
 module.exports = new Proxy(target, {
   get(t, prop) {
+    if (prop === '__esModule') return true;
+    if (prop === 'default') return t;
     if (prop in t) return t[prop];
     return () => null;
   }
@@ -155,12 +187,26 @@ module.exports = new Proxy(target, {
         content: `module.exports = { RnDiscovery: class {} };`,
       },
       {
+        path: 'rn.js',
+        content: `module.exports = { RnTcpTransport: class {} };`,
+      },
+      {
+        path: 'rn-discovery.js',
+        content: `module.exports = { RnDiscovery: class {} };`,
+      },
+      {
         path: 'package.json',
         content: JSON.stringify(
           {
             name: '@offgrid/sync',
             version: '0.0.1',
             main: 'dist/index.js',
+            exports: {
+              '.': './dist/index.js',
+              './portable': './dist/portable/index.js',
+              './rn': './dist/adapters/rn-tcp.js',
+              './rn-discovery': './dist/adapters/rn-discovery.js',
+            },
           },
           null,
           2,
@@ -197,8 +243,13 @@ const target = {
   transcriptionLanguages: [],
 };
 
+target.__esModule = true;
+target.default = target;
+
 module.exports = new Proxy(target, {
   get(t, prop) {
+    if (prop === '__esModule') return true;
+    if (prop === 'default') return t;
     if (prop in t) return t[prop];
     return () => null;
   }
@@ -231,8 +282,13 @@ const target = {
   projectProgress: () => ({ progress: 0 }),
 };
 
+target.__esModule = true;
+target.default = target;
+
 module.exports = new Proxy(target, {
   get(t, prop) {
+    if (prop === '__esModule') return true;
+    if (prop === 'default') return t;
     if (prop in t) return t[prop];
     return () => null;
   }
