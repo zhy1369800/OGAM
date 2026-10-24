@@ -40,6 +40,7 @@
  * per-load, user-confirmed way to push past whatever budget is in effect.
  */
 import { Platform } from 'react-native';
+import { fitTier, PHONE_FIT_BUDGET, phoneFitBudget, type FitBudget, type FitTier } from '@offgrid/models';
 
 /**
  * How the residency manager handles multiple models:
@@ -137,18 +138,27 @@ export function modelWarningThresholdMB(totalRamMB: number, platform: Plat = Pla
   return Math.min(byFraction, modelMemoryBudgetMB(totalRamMB, platform));
 }
 
-const BYTES_PER_GB = 1024 ** 3;
-
 /**
- * Does a model file's on-disk size exceed this device's safe RAM budget
- * (`totalRamGB * modelBudgetFraction`)? The SINGLE device-aware fit primitive that
+ * Is a model file "Too big" for this phone under the shared fit rule? The device-aware fit primitive that
  * every download-warning decision and the detail-list compatibility filter compute
  * from — a static per-model flag was device-blind and fired on every device. Zero-IO
  * so it is unit-testable; callers pass the RAM read from the device boundary
  * (hardwareService.getTotalMemoryGB).
  */
-export function fileExceedsBudget(sizeBytes: number, ramGB: number): boolean {
-  return sizeBytes / BYTES_PER_GB >= ramGB * modelBudgetFraction(ramGB);
+export function fileExceedsBudget(sizeBytes: number, ramGB: number, budget: FitBudget = PHONE_FIT_BUDGET): boolean {
+  return modelFitTier(sizeBytes, ramGB, budget) === 'wontFit';
+}
+
+/** The fit budget for a GGUF chat model on this phone: an iPhone maps its weights, Android copies
+ *  them (shared rule). Other models (image, speech, LiteRT) are not mapped: they keep PHONE_FIT_BUDGET. */
+export function textModelBudget(): FitBudget {
+  return phoneFitBudget(Platform.OS === 'ios' ? 'ios' : 'android');
+}
+
+/** The one fit verdict (shared with Desktop) for a download of this size on this phone: the
+ *  shared rule with the phone budget. Cards, the detail list and the pickers all read this. */
+export function modelFitTier(sizeBytes: number, ramGB: number, budget: FitBudget = PHONE_FIT_BUDGET): FitTier {
+  return fitTier(sizeBytes / 1e9, ramGB, budget);
 }
 
 /**

@@ -25,6 +25,7 @@ import { createStyles } from './styles';
 import { useChatScreen } from './useChatScreen';
 import { MessageRenderer } from './MessageRenderer';
 import { NoModelScreen, ChatHeader } from './ChatScreenComponents';
+import { openDocumentPage, useChatDocumentsSheet } from '../../components/ChatDocumentsSheet';
 import { ChatModalSection } from './ChatModalSection';
 import { ChatMessageArea } from './ChatMessageArea';
 import {
@@ -35,7 +36,9 @@ import { WhisperPickerSheet } from '../../components/models/WhisperPickerSheet';
 import { VoiceModelsSheet } from '../../components/models/VoiceModelsSheet';
 import { useWhisperStore } from '../../stores/whisperStore';
 import { WHISPER_MODELS } from '../../services';
+import { useWithRemoteCatalog } from '../../stores/modelCatalogStore';
 import { useActiveRemoteModelLabels } from '../../hooks/useActiveRemoteModelLabels';
+import { useChatStore } from '../../stores';
 
 function countConversationImages(conv: Conversation | undefined): number {
   return (conv?.messages || []).reduce(
@@ -66,6 +69,7 @@ export const ChatScreen: React.FC = () => {
     'text',
   );
   const [whisperOpen, setWhisperOpen] = useState(false);
+  const documents = useChatDocumentsSheet(chat.activeConversation, rootNavigation);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const returnToModelsRef = useRef(false);
   const reopenModelsAfterChildClose = () => {
@@ -75,6 +79,7 @@ export const ChatScreen: React.FC = () => {
   };
   const voiceSummary = useUiModeStore(s => s.voiceSummary);
   const whisperModelId = useWhisperStore(s => s.downloadedModelId);
+  const whisperModels = useWithRemoteCatalog('transcription', WHISPER_MODELS);
   const remoteLabels = useActiveRemoteModelLabels();
   const modelLabels: Record<ModelRowType, string> = {
     text: chat.activeModelName ?? chat.activeModel?.name ?? '—',
@@ -82,7 +87,7 @@ export const ChatScreen: React.FC = () => {
     voice: remoteLabels.voice ?? voiceSummary ?? '—',
     speech:
       remoteLabels.transcription ??
-      WHISPER_MODELS.find(m => m.id === whisperModelId)?.name ??
+      whisperModels.find(m => m.id === whisperModelId)?.name ??
       '—',
   };
   const pendingModelRowRef = useRef<ModelRowType | null>(null);
@@ -254,9 +259,15 @@ export const ChatScreen: React.FC = () => {
         return chat.handleRetryMessage(message, selected);
       }}
       onEdit={chat.handleEditMessage}
+      onSelectVersion={(message, direction) => {
+        const conversationId = chat.activeConversation?.id;
+        if (conversationId)
+          useChatStore.getState().selectMessageVersion(conversationId, message, direction);
+      }}
       onTranscribeAgain={chat.handleTranscribeAgain}
       onGenerateImage={chat.handleGenerateImageFromMessage}
       onImagePress={chat.handleImagePress}
+      onCitationPress={source => openDocumentPage(rootNavigation, source)}
     />
   );
 
@@ -283,7 +294,10 @@ export const ChatScreen: React.FC = () => {
           setShowSettingsPanel={chat.setShowSettingsPanel}
           setShowProjectSelector={chat.setShowProjectSelector}
           isRemote={chat.activeModelInfo?.isRemote}
+          documentCount={documents.count}
+          onOpenDocuments={documents.open}
         />
+        {documents.sheet}
         <ModelsManagerSheet
           visible={modelsManagerOpen}
           onClose={() => setModelsManagerOpen(false)}

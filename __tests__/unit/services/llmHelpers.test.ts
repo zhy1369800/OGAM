@@ -10,10 +10,10 @@ import {
   effectiveCacheType,
   backendForcesF16Cache,
   buildCompletionParams,
-  shouldDisableMmap,
   captureGpuInfo,
   logContextMetadata,
   initContextWithFallback,
+  completionEnd,
 } from '../../../src/services/llmHelpers';
 import { Platform } from 'react-native';
 import { INFERENCE_BACKENDS } from '../../../src/types';
@@ -311,13 +311,6 @@ describe('getModelMaxContext — alternative metadata keys', () => {
   it('returns null when context length is zero or negative', () => {
     const ctx = { model: { metadata: { 'llama.context_length': '0' } } } as any;
     expect(getModelMaxContext(ctx)).toBeNull();
-  });
-});
-
-describe('shouldDisableMmap', () => {
-  it('returns false on non-android', () => {
-    // Platform.OS is mocked as 'ios' in test env
-    expect(shouldDisableMmap('/path/to/model.q4_0.gguf')).toBe(false);
   });
 });
 
@@ -627,5 +620,34 @@ describe('backendForcesF16Cache / effectiveCacheType (single source)', () => {
     // Guards against the loader and the reporter drifting apart again.
     const params = buildModelParams('/m.gguf', { inferenceBackend: INFERENCE_BACKENDS.HTP, cacheType: 'q8_0' });
     expect((params.baseParams as any).cache_type_k).toBe(effectiveCacheType(INFERENCE_BACKENDS.HTP, 'q8_0'));
+  });
+});
+
+describe('completionEnd — why a llama completion stopped (device result shapes)', () => {
+  const base = { interrupted: false, stopped_eos: false, stopped_word: false, stopped_limit: 0, truncated: false, context_full: false, tokens_evaluated: 40, tokens_predicted: 20 };
+  it('EOS or a stop word is a finished reply', () => {
+    expect(completionEnd({ ...base, stopped_eos: true })).toBe('finished');
+    expect(completionEnd({ ...base, stopped_word: '</s>' })).toBe('finished');
+  });
+  it('a user Stop is stopped, even when the cap flag is also set', () => {
+    expect(completionEnd({ ...base, interrupted: true, stopped_limit: 1 })).toBe('stopped');
+  });
+  it('the n_predict cap is the token limit (B15)', () => {
+    expect(completionEnd({ ...base, stopped_limit: 1 })).toBe('token-limit');
+    expect(completionEnd({ ...base, stopped_limit: true })).toBe('token-limit');
+    expect(completionEnd({ ...base, truncated: true })).toBe('token-limit');
+  });
+  it('a full window is context-full, flagged or not (ctx_shift off sets no flag)', () => {
+    expect(completionEnd({ ...base, context_full: true })).toBe('context-full');
+    expect(completionEnd({ ...base, tokens_evaluated: 2000, tokens_predicted: 47 }, 2048)).toBe('context-full');
+  });
+  it('none of those is ended early (a backend fault: the iOS background Metal error)', () => {
+    expect(completionEnd(base, 2048)).toBe('ended-early');
+    expect(completionEnd({ stopped_eos: false })).toBe('ended-early');
+  });
+  it('a result that is not native-shaped is never read as a fault', () => {
+    expect(completionEnd(null)).toBe('finished');
+    expect(completionEnd(undefined)).toBe('finished');
+    expect(completionEnd({ interrupted: false })).toBe('finished');
   });
 });

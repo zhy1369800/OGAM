@@ -7,6 +7,7 @@ import {
   FlatList,
   Platform,
 } from 'react-native';
+import { LIST_CLIPPING_PROPS } from '../constants/listClipping';
 import { LoadingDots } from '../components/LoadingDots';
 import Icon from 'react-native-vector-icons/Feather';
 import {
@@ -19,16 +20,19 @@ import { resolvePickedFileUri } from '../utils/resolvePickedFileUri';
 import { Button } from '../components/Button';
 import { showAlert, AlertState } from '../components/CustomAlert';
 import { PasteNoteSheet } from '../components/knowledge/PasteNoteSheet';
-import { ragService } from '../services/rag';
-import type { RagDocument } from '../services/rag';
+import {
+  KnowledgeDocumentInfo,
+  KnowledgeTransferInfo,
+} from '../components/knowledge/KnowledgeDocumentInfo';
+import { useKnowledgeDocumentTransfers } from '../hooks/useKnowledgeDocumentTransfers';
+import {
+  arrivingKnowledgeDocumentTransfers,
+  knowledgeDocumentTransferKey,
+  rowKnowledgeDocumentTransfer,
+} from '../services/sync/knowledgeDocumentTransfer';
+import { knowledgeBase } from '../services/rag';
+import type { KnowledgeDocument } from '../services/rag';
 import { isPickerStuck } from '../utils/pickerErrorUtils';
-
-const formatFileSize = (bytes: number): string => {
-  if (bytes < 1024) return `${bytes} B`;
-  return bytes < 1024 * 1024
-    ? `${(bytes / 1024).toFixed(1)} KB`
-    : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-};
 
 export interface KBSectionProps {
   projectId: string;
@@ -36,7 +40,8 @@ export interface KBSectionProps {
   styles: any;
   setAlertState: (state: AlertState) => void;
   onNavigateToKb: () => void;
-  onDocumentPress: (doc: RagDocument) => void;
+  /** Opens the file's pages; only called for a file the document index knows. */
+  onDocumentPress: (doc: KnowledgeDocument & { document_id: string }) => void;
 }
 
 export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
@@ -47,15 +52,15 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
   onNavigateToKb,
   onDocumentPress,
 }) => {
-  const [kbDocs, setKbDocs] = useState<RagDocument[]>([]);
-  const [indexingFile, setIndexingFile] = useState<string | null>(null);
+  const [kbDocs, setKbDocs] = useState<KnowledgeDocument[]>([]);
+  const [addingFile, setAddingFile] = useState<string | null>(null);
   const [isPicking, setIsPicking] = useState(false);
   const [pasting, setPasting] = useState(false);
   const isPickingRef = useRef(false);
 
   const loadKbDocs = useCallback(async () => {
     try {
-      setKbDocs(await ragService.getDocumentsByProject(projectId));
+      setKbDocs(await knowledgeBase.getDocumentsByProject(projectId));
     } catch (err: any) {
       setAlertState(
         showAlert('Error', err?.message || 'Failed to load documents'),
@@ -66,6 +71,16 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
   useEffect(() => {
     loadKbDocs();
   }, [loadKbDocs]);
+
+  // Files moving to or from paired devices. A received file reloads the list so its own row shows.
+  const { transfers, dismiss: dismissTransfer } = useKnowledgeDocumentTransfers(
+    projectId,
+    loadKbDocs,
+  );
+  const arriving = arrivingKnowledgeDocumentTransfers(
+    transfers,
+    new Set(kbDocs.map(doc => doc.sync_id)),
+  );
 
   const handleAddDocument = async () => {
     if (isPickingRef.current) return;
@@ -83,7 +98,7 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const fileName = file.name || 'document';
-        setIndexingFile(
+        setAddingFile(
           files.length > 1
             ? `${fileName} (${i + 1}/${files.length})`
             : fileName,
@@ -91,7 +106,8 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
 
         const pathForDb = await resolvePickedFileUri(file.uri, fileName);
 
-        await ragService.indexDocument({
+        // Adding keeps the file and starts reading it in the background; its row shows the progress.
+        await knowledgeBase.addFile({
           projectId,
           filePath: pathForDb,
           fileName,
@@ -112,12 +128,12 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
         return;
       }
       setAlertState(
-        showAlert('Error', err.message || 'Failed to index document'),
+        showAlert('Error', err.message || 'Failed to add document'),
       );
     } finally {
       isPickingRef.current = false;
       setIsPicking(false);
-      setIndexingFile(null);
+      setAddingFile(null);
     }
   };
 
@@ -125,18 +141,18 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
     title: string,
     text: string,
   ): Promise<void> => {
-    setIndexingFile(title.trim() || 'pasted text');
+    setAddingFile(title.trim() || 'pasted text');
     try {
-      await ragService.indexPastedText({ projectId, title, text });
+      await knowledgeBase.addPastedText({ projectId, title, text });
       await loadKbDocs();
     } finally {
-      setIndexingFile(null);
+      setAddingFile(null);
     }
   };
 
   const handleToggleDocument = async (docId: number, enabled: boolean) => {
     try {
-      await ragService.toggleDocument(docId, enabled);
+      await knowledgeBase.toggleDocument(docId, enabled);
       await loadKbDocs();
     } catch (err: any) {
       setAlertState(
@@ -145,7 +161,7 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
     }
   };
 
-  const handleDeleteDocument = (doc: RagDocument) => {
+  const handleDeleteDocument = (doc: KnowledgeDocument) => {
     setAlertState(
       showAlert(
         'Remove Document',
@@ -156,7 +172,7 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
             text: 'Remove',
             style: 'destructive',
             onPress: () => {
-              ragService
+              knowledgeBase
                 .deleteDocument(doc.id)
                 .then(() => loadKbDocs())
                 .catch((err: any) =>
@@ -203,7 +219,7 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
             size="small"
             onPress={() => setPasting(true)}
             testID="kb-paste-text"
-            disabled={isPicking || !!indexingFile}
+            disabled={isPicking || !!addingFile}
             icon={<Icon name="type" size={16} color={colors.textSecondary} />}
           />
           <Button
@@ -212,7 +228,7 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
             size="small"
             onPress={handleAddDocument}
             testID="kb-add-document"
-            disabled={isPicking || !!indexingFile}
+            disabled={isPicking || !!addingFile}
             icon={<Icon name="plus" size={16} color={colors.primary} />}
           />
           <Icon
@@ -224,39 +240,75 @@ export const KnowledgeBaseSection: React.FC<KBSectionProps> = ({
         </View>
       </TouchableOpacity>
 
-      {indexingFile && (
+      {addingFile && (
         <View style={styles.kbIndexing}>
           <LoadingDots color={colors.primary} />
           <Text style={styles.kbIndexingText} numberOfLines={1}>
-            Indexing {indexingFile}...
+            Adding {addingFile}...
           </Text>
         </View>
       )}
 
-      {kbDocs.length === 0 && !indexingFile ? (
-        <View style={styles.emptyState}>
-          <Icon name="file-text" size={24} color={colors.textMuted} />
-          <Text style={styles.emptyStateText}>No documents added</Text>
+      {arriving.map(transfer => (
+        <View
+          key={knowledgeDocumentTransferKey(transfer)}
+          style={styles.kbDocRow}
+          testID={`kb-document-arriving-${transfer.syncId}`}
+        >
+          <Icon
+            name={transfer.status === 'failed' ? 'alert-circle' : 'download'}
+            size={14}
+            color={transfer.status === 'failed' ? colors.error : colors.textMuted}
+            style={styles.kbTransferIcon}
+          />
+          <View style={styles.kbDocInfo}>
+            <KnowledgeTransferInfo transfer={transfer} />
+          </View>
+          {transfer.status === 'failed' && (
+            <TouchableOpacity
+              style={styles.kbDocDelete}
+              onPress={() => dismissTransfer(transfer)}
+              accessibilityRole="button"
+              accessibilityLabel={`Dismiss ${transfer.fileName}`}
+            >
+              <Icon name="x" size={14} color={colors.textMuted} />
+            </TouchableOpacity>
+          )}
         </View>
+      ))}
+
+      {kbDocs.length === 0 && !addingFile ? (
+        arriving.length > 0 ? null : (
+          <View style={styles.emptyState}>
+            <Icon name="file-text" size={24} color={colors.textMuted} />
+            <Text style={styles.emptyStateText}>No documents added</Text>
+          </View>
+        )
       ) : (
         <FlatList
           style={styles.sectionList}
           data={kbDocs}
           keyExtractor={doc => String(doc.id)}
-          removeClippedSubviews={Platform.OS !== 'android'}
+          {...LIST_CLIPPING_PROPS}
           renderItem={({ item: doc }) => (
             <TouchableOpacity
               style={styles.kbDocRow}
-              onPress={() => onDocumentPress(doc)}
+              onPress={() => {
+                const documentId = doc.document_id;
+                if (documentId) onDocumentPress({ ...doc, document_id: documentId });
+              }}
+              disabled={!doc.document_id}
               activeOpacity={0.7}
               accessibilityLabel={`Knowledge document ${doc.name}`}
               testID={`kb-document-row-${doc.sync_id}`}
             >
               <View style={styles.kbDocInfo}>
-                <Text style={styles.kbDocName} numberOfLines={1}>
-                  {doc.name}
-                </Text>
-                <Text style={styles.kbDocSize}>{formatFileSize(doc.size)}</Text>
+                <KnowledgeDocumentInfo
+                  name={doc.name}
+                  size={doc.size}
+                  documentId={doc.document_id}
+                  transfer={rowKnowledgeDocumentTransfer(transfers, doc.sync_id)}
+                />
               </View>
               <Switch
                 value={doc.enabled === 1}

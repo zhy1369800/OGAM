@@ -10,7 +10,7 @@
  * The whisper store tracks a single active model; downloading another switches
  * the active one.
  */
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { View, Text, ScrollView, TouchableOpacity } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/Feather';
@@ -25,9 +25,11 @@ import {
 import { useTheme, useThemedStyles } from '../../theme';
 import type { ThemeColors, ThemeShadows } from '../../theme';
 import { TYPOGRAPHY, SPACING } from '../../constants';
-import { useWhisperStore } from '../../stores';
+import { useWhisperStore, useAppStore } from '../../stores';
 import { useSttDownloadState } from '../../hooks/useSttDownloadState';
+import type { MobileWhisperCatalogModel } from '@offgrid/models';
 import { WHISPER_MODELS } from '../../services';
+import { useWithRemoteCatalog } from '../../stores/modelCatalogStore';
 import { createStyles as createModelsScreenStyles } from './styles';
 import logger from '../../utils/logger';
 import { RemoteModelOptionsSection } from '../../components/models/RemoteModelOptionsSection';
@@ -35,15 +37,15 @@ import { useActiveRemoteModelLabels } from '../../hooks/useActiveRemoteModelLabe
 import { remoteServerManager } from '../../services/remoteServerManager';
 import { modelDownloadService } from '../../services/modelDownloadService';
 import { uniformDownloadId } from '../../services/modelDownloadService/uniformId';
-
-const ENGLISH_MODELS = WHISPER_MODELS.filter(m => m.lang === 'en');
-const MULTI_MODELS = WHISPER_MODELS.filter(m => m.lang === 'multi');
+import { picksAmong } from '../../services/devicePicks';
+import { hardwareService } from '../../services/hardware';
+import { PicksRow, type PickState } from '../../components/models/PicksRow';
 
 const formatSize = (mb: number): string =>
   mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`;
 
 interface WhisperCardProps {
-  model: (typeof WHISPER_MODELS)[number];
+  model: MobileWhisperCatalogModel;
   index: number;
   downloadedModelId: string | null;
   presentModelIds: string[];
@@ -146,6 +148,9 @@ export const TranscriptionModelsTab: React.FC<TranscriptionModelsTabProps> = ({
 }) => {
   const { colors } = useTheme();
   const styles = useThemedStyles(createStyles);
+  const whisperModels = useWithRemoteCatalog('transcription', WHISPER_MODELS);
+  const englishModels = useMemo(() => whisperModels.filter(m => m.lang === 'en'), [whisperModels]);
+  const multiModels = useMemo(() => whisperModels.filter(m => m.lang === 'multi'), [whisperModels]);
   // Reuse the Models screen's shared banner styling so it matches the other tabs.
   const shared = useThemedStyles(createModelsScreenStyles);
   const [alertState, setAlertState] = useState<AlertState>(initialAlertState);
@@ -213,7 +218,7 @@ export const TranscriptionModelsTab: React.FC<TranscriptionModelsTabProps> = ({
       setAlertState(
         showAlert(
           'Remove Transcription Model',
-          `Delete "${WHISPER_MODELS.find(model => model.id === id)?.name ?? id}"? This will free up about ${formatSize(WHISPER_MODELS.find(model => model.id === id)?.size ?? 0)}.`,
+          `Delete "${whisperModels.find(model => model.id === id)?.name ?? id}"? This will free up about ${formatSize(whisperModels.find(model => model.id === id)?.size ?? 0)}.`,
           [
       { text: 'Cancel', style: 'cancel' },
             {
@@ -228,11 +233,30 @@ export const TranscriptionModelsTab: React.FC<TranscriptionModelsTabProps> = ({
         ),
       );
     },
-    [deleteModelById],
+    [deleteModelById, whisperModels],
   );
 
+  // Fast, Balanced and Best by the shared rule. Multilingual models only: they work for everyone.
+  // Re-read when the device reading lands, so picks are never worked out for the fallback RAM.
+  const deviceRam = useAppStore(state => state.deviceInfo?.totalMemory);
+  const speechPicks = useMemo(
+    () => picksAmong(multiModels, model => ({ id: model.id, sizeBytes: model.size * 1e6 }), hardwareService.getTotalMemoryGB()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [deviceRam, multiModels],
+  );
+  // A pick is shown once, in the row above; the list leaves out that exact model.
+  const pickedIds = new Set(speechPicks.map(({ item }) => item.id));
+  const speechPickState = (id: string): PickState => {
+    if (presentModelIds.includes(id)) {
+      return downloadedModelId === id ? { kind: 'active' } : { kind: 'use', onUse: () => handleSelect(id) };
+    }
+    const state = downloadStateFor(id);
+    if (state?.downloading || state?.queued) return { kind: 'downloading', progress: state.progress ?? 0 };
+    return { kind: 'download', onDownload: () => handleDownload(id) };
+  };
+
   const renderWhisperCard = (
-    model: (typeof WHISPER_MODELS)[number],
+    model: MobileWhisperCatalogModel,
     index: number,
   ) => {
     const state = downloadStateFor(model.id);
@@ -298,11 +322,19 @@ export const TranscriptionModelsTab: React.FC<TranscriptionModelsTabProps> = ({
         <RemoteModelOptionsSection category="transcription" />
       )}
 
+      <PicksRow testID="speech-picks" items={speechPicks.map(({ slot, item }) => ({
+        slot,
+        name: item.name,
+        sizeBytes: item.size * 1e6,
+        state: speechPickState(item.id),
+      }))} />
+
       <Text style={styles.sectionLabel}>English only</Text>
-      {ENGLISH_MODELS.map((m, i) => renderWhisperCard(m, i))}
+      {englishModels.map((m, i) => renderWhisperCard(m, i))}
 
       <Text style={styles.sectionLabel}>Multilingual - 99 languages</Text>
-      {MULTI_MODELS.map((m, i) => renderWhisperCard(m, ENGLISH_MODELS.length + i))}
+      {/* The card keeps its catalogue position as its index, so a card means the same model whatever the picks are. */}
+      {multiModels.map((m, i) => (pickedIds.has(m.id) ? null : renderWhisperCard(m, englishModels.length + i)))}
 
       <CustomAlert visible={alertState.visible} title={alertState.title}
         message={alertState.message} buttons={alertState.buttons}

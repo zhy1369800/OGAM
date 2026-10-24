@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { View, Text, TouchableOpacity, Clipboard } from 'react-native';
 import type { StyleProp, ViewStyle } from 'react-native';
 import { useTheme, useThemedStyles } from '../../theme';
@@ -32,6 +32,7 @@ import {
 import type { ChatMessageProps } from './types';
 import type { Message } from '../../types';
 import { isSupportingChatContext } from '@offgrid/sync';
+import { VersionSwitcher } from './components/VersionSwitcher';
 
 type MetaRowProps = {
   message: Message;
@@ -183,10 +184,18 @@ interface MessageBubbleProps {
   hideProse?: boolean;
   metaExtra?: React.ReactNode;
   onImagePress?: (uri: string) => void;
+  onCitationPress?: ChatMessageProps['onCitationPress'];
   onToggleThinking: () => void;
   onToggleSupportingContext: () => void;
   onLongPress: () => void;
   onMenuOpen: () => void;
+}
+
+/** The note under a reply that did not finish: cut at the token cap, or ended early (a backend fault). */
+function cutoffNoteFor(meta: Message['generationMeta']): string | null {
+  if (meta?.truncated) return 'Reply cut off at the token limit. Retry to continue.';
+  if (meta?.endedEarly) return 'Reply stopped early. Retry to continue.';
+  return null;
 }
 
 const MessageBubble: React.FC<MessageBubbleProps> = ({
@@ -206,6 +215,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({
   hideProse,
   metaExtra,
   onImagePress,
+  onCitationPress,
   onToggleThinking,
   onToggleSupportingContext,
   onLongPress,
@@ -239,6 +249,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({
   // footer, and retries must not leave one metadata block per empty attempt.
   const showTurnFooter =
     !hideProse && !isUser && !isStreaming && hasVisibleAnswer;
+  const cutoffNote = cutoffNoteFor(message.generationMeta);
   return (
     <TouchableOpacity
       testID={isUser ? 'user-message' : 'assistant-message'}
@@ -334,6 +345,8 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({
             showThinking={showThinking}
             onToggleThinking={onToggleThinking}
             styles={styles}
+            documentSources={message.documentSources}
+            onCitationPress={onCitationPress}
           />
         </View>
       )}
@@ -359,12 +372,10 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({
         />
       )}
 
-      {showTurnFooter && message.generationMeta?.truncated && (
+      {showTurnFooter && cutoffNote && (
         <View testID="message-cutoff-indicator" style={styles.toolStatusRow}>
           <Icon name="alert-triangle" size={12} color={colors.textMuted} />
-          <Text style={styles.toolStatusText}>
-            Reply cut off at the token limit. Retry to continue.
-          </Text>
+          <Text style={styles.toolStatusText}>{cutoffNote}</Text>
         </View>
       )}
 
@@ -385,9 +396,11 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
   supportingContext,
   isStreaming: isStreamingProp,
   onImagePress,
+  onCitationPress,
   onCopy,
   onRetry,
   onEdit,
+  onSelectVersion,
   onGenerateImage,
   showActions = true,
   canGenerateImage = false,
@@ -400,9 +413,19 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
 }) => {
   const { colors } = useTheme();
   const styles = useThemedStyles(createStyles);
-  const ttsCanSpeak = callHook<boolean>(HOOKS.audioCanSpeak) ?? false;
+  const [ttsCanSpeak, setTtsCanSpeak] = useState(false);
   const isStreaming = Boolean(isStreamingProp || message.isStreaming);
   const [showActionMenu, setShowActionMenu] = useState(false);
+  useEffect(() => {
+    let current = true;
+    setTtsCanSpeak(false);
+    if (showActionMenu) {
+      Promise.resolve(callHook<boolean | Promise<boolean>>(HOOKS.audioCanSpeak) ?? false)
+        .then(canSpeak => { if (current) setTtsCanSpeak(canSpeak); })
+        .catch(() => { if (current) setTtsCanSpeak(false); });
+    }
+    return () => { current = false; };
+  }, [showActionMenu]);
   const [isEditing, setIsEditing] = useState(false);
   const [showThinking, setShowThinking] = useState(!!isStreaming);
   const [showSupportingContext, setShowSupportingContext] = useState(false);
@@ -560,6 +583,7 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
       hideProse={hideProse}
       metaExtra={metaExtra}
       onImagePress={onImagePress}
+      onCitationPress={onCitationPress}
       onToggleThinking={() => setShowThinking(!showThinking)}
       onToggleSupportingContext={() =>
         setShowSupportingContext(!showSupportingContext)
@@ -576,6 +600,12 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
       ) : (
         messageBody
       )}
+      {onSelectVersion && !isStreaming ? (
+        <VersionSwitcher
+          message={message}
+          onSelect={direction => onSelectVersion(message, direction)}
+        />
+      ) : null}
 
       <MessageOverlays
         message={message}

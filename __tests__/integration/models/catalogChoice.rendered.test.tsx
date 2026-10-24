@@ -22,6 +22,8 @@ describe('Model choice on the phone', () => {
     installNativeBoundary({ fs: true, ram: { platform: 'android', totalBytes: 11 * GB, availBytes: 8 * GB } });
     const React = require('react');
     const { render, waitFor, within } = requireRTL();
+    // The app reads the phone's memory at launch (Home), before the Models screen opens.
+    await require('../../../src/services/hardware').hardwareService.getDeviceInfo();
     const { ModelsScreen } = require('../../../src/screens/ModelsScreen');
     const screen = render(React.createElement(ModelsScreen));
 
@@ -72,7 +74,7 @@ describe('Model choice on the phone', () => {
     expect(home.queryByText('TEXT MODEL')).toBeNull();
   });
 
-  it('keeps size, type, RAM, and curated facts on a compact model card', () => {
+  it('keeps size, quant, params and curated facts on a compact model card, without type, RAM or a trending mark', () => {
     installNativeBoundary();
     const React = require('react');
     const { render } = requireRTL();
@@ -83,8 +85,9 @@ describe('Model choice on the phone', () => {
       compact: true,
       recommended: { chips: ['Fast'] },
     }));
-    expect(card.getByText(/Q4_K_M.*Text.*7B params.*8GB\+ RAM.*Fast/)).toBeTruthy();
-    expect(card.getByLabelText('Recommended')).toBeTruthy();
+    expect(card.getByText(/Q4_K_M.*7B params.*Fast/)).toBeTruthy();
+    expect(card.queryByText(/Text|RAM/)).toBeNull();
+    expect(card.queryByLabelText('Recommended')).toBeNull();
     expect(card.queryByText('Recommended')).toBeNull();
   });
 

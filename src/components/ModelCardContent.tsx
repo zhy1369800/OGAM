@@ -27,6 +27,17 @@ export interface RecommendedConfig {
   chips?: string[];
 }
 
+/** What a card's badge row shows. `predicted` softens the labels ("likely") for a guess from the
+ *  name; the speed badges are catalog facts: a mixture-of-experts active size and an MTP head. */
+export interface ModelCardCapabilities {
+  tools?: boolean;
+  thinking?: boolean;
+  vision?: boolean;
+  predicted?: boolean;
+  moeActiveB?: number;
+  mtp?: boolean;
+}
+
 interface DenseModelCardContentProps {
   model: {
     name: string;
@@ -47,7 +58,7 @@ interface DenseModelCardContentProps {
   credibilityLabel?: string;
   incompatibleReason?: string;
   facts?: string[];
-  capabilities?: { tools?: boolean; thinking?: boolean; vision?: boolean; predicted?: boolean };
+  capabilities?: ModelCardCapabilities;
   sourceBadge?: string;
   nameTestID?: string;
   factsTestID?: string;
@@ -62,9 +73,7 @@ export const DenseModelCardContent: React.FC<DenseModelCardContentProps> = ({
   fileSize,
   quantization,
   isVisionModel,
-  supportsAcceleration,
   recommended,
-  isTrending,
   credibilitySource,
   credibilityLabel,
   incompatibleReason,
@@ -77,24 +86,24 @@ export const DenseModelCardContent: React.FC<DenseModelCardContentProps> = ({
   const { colors } = useTheme();
   const styles = useThemedStyles(createStyles);
   const description = cardDescription(model.description, recommended?.highlightText);
-  const modelType = isVisionModel || model.modelType === 'vision' ? 'Vision'
-    : model.modelType === 'code' ? 'Code' : model.modelType === 'text' ? 'Text' : undefined;
+  // "Code" says what a model is good at; "Text" and "Vision" repeat what the icons already say.
+  const goodAt = model.modelType === 'code' ? 'Code' : undefined;
+  // Only what differs between cards and helps a choice: size, the model's own facts, and the fit.
+  // Download counts, the "Text" type and the NPU/GPU chip repeated on nearly every card; the
+  // backend choice is made once in settings ("Use fastest settings").
   const facts = [...new Set([
     fileSize > 0 ? huggingFaceService.formatFileSize(fileSize) : undefined,
     quantization && quantization !== 'Unknown' ? quantization : undefined,
-    capabilities?.vision || isVisionModel ? undefined : modelType,
+    goodAt,
     model.paramCount ? `${model.paramCount}B params` : undefined,
-    model.minRamGB ? `${model.minRamGB}GB+ RAM` : undefined,
-    supportsAcceleration ? 'NPU/GPU' : undefined,
     ...(recommended?.chips ?? []),
     ...additionalFacts,
-    model.downloads ? `${formatCompactNumber(model.downloads)} dl` : undefined,
     incompatibleReason,
   ].filter((value): value is string => !!value))];
   const hasVerifiedMark =
     credibilitySource === 'verified-quantizer' || credibilitySource === 'official';
+  // Who published a model is shown as one verified mark, not a name on every card.
   const sourceLabels = [
-    model.author && model.author !== 'Unknown' ? model.author : undefined,
     credibilitySource && credibilitySource !== 'community' && !hasVerifiedMark ? credibilityLabel : undefined,
   ].filter((value): value is string => !!value);
 
@@ -116,9 +125,7 @@ export const DenseModelCardContent: React.FC<DenseModelCardContentProps> = ({
           {sourceLabels.length > 0 && <Text style={styles.denseSource} numberOfLines={1}>
             {sourceLabels.join(' · ')}
           </Text>}
-          {(recommended || isTrending) && (
-            <MaterialIcon name="whatshot" size={14} color={colors.trending} accessibilityLabel={isTrending ? 'Trending' : 'Recommended'} />
-          )}
+
         </View>
       </View>
       {!!description && (
@@ -127,28 +134,54 @@ export const DenseModelCardContent: React.FC<DenseModelCardContentProps> = ({
       {facts.length > 0 && (
         <Text style={styles.denseMeta} numberOfLines={2} testID={factsTestID}>{facts.join(' · ')}</Text>
       )}
-      {(capabilities?.vision || isVisionModel || capabilities?.tools || capabilities?.thinking) && (
-        <View style={styles.capabilityRow}>
-          {(capabilities?.vision || isVisionModel) && <View style={styles.capabilityBadge} accessibilityLabel="Vision">
-            <Icon name="eye" size={13} color={colors.info} />
-          </View>}
-          {capabilities?.tools && <View style={styles.capabilityBadge} accessibilityLabel={capabilities.predicted ? 'Tool calling likely' : 'Tool calling'}>
-            <Icon name="tool" size={13} color={colors.warning} />
-          </View>}
-          {capabilities?.thinking && <View style={styles.capabilityBadge} accessibilityLabel={capabilities.predicted ? 'Thinking likely' : 'Thinking'}>
-            <Icon name="zap" size={13} color={colors.primary} />
-          </View>}
-        </View>
-      )}
+      <CapabilityBadges capabilities={capabilities} isVisionModel={isVisionModel} />
     </>
   );
 };
 
-function formatCompactNumber(value: number): string {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
-  return String(value);
+
+/** What the speed badges say, in words: the badges' own labels and the card's accessibility hint,
+ *  since a screen reader focuses the whole card and does not reach the badges inside it. */
+function speedDescriptions(capabilities?: ModelCardCapabilities): string[] {
+  return [
+    capabilities?.moeActiveB ? `Mixture of experts: runs like a ${capabilities.moeActiveB}B model` : undefined,
+    capabilities?.mtp ? 'MTP: replies faster' : undefined,
+  ].filter((text): text is string => !!text);
 }
+
+/** The speed descriptions as one accessibility hint for the whole card, or none. */
+export function speedHint(capabilities?: ModelCardCapabilities): string | undefined {
+  return speedDescriptions(capabilities).join('. ') || undefined;
+}
+
+/** The badge row: what makes a model fast for its size first, then what it can do. */
+const CapabilityBadges: React.FC<{ capabilities?: ModelCardCapabilities; isVisionModel: boolean }> = ({ capabilities, isVisionModel }) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(createStyles);
+  const vision = capabilities?.vision || isVisionModel;
+  if (!vision && !capabilities?.tools && !capabilities?.thinking && !capabilities?.moeActiveB && !capabilities?.mtp) return null;
+  return (
+    <View style={styles.capabilityRow}>
+      {!!capabilities?.moeActiveB && <View style={styles.capabilityBadge} accessibilityLabel={speedDescriptions({ moeActiveB: capabilities.moeActiveB })[0]}>
+        <Icon name="layers" size={13} color={colors.primary} />
+        <Text style={styles.capabilityText}>{`MoE ${capabilities.moeActiveB}B`}</Text>
+      </View>}
+      {capabilities?.mtp && <View style={styles.capabilityBadge} accessibilityLabel={speedDescriptions({ mtp: true })[0]}>
+        <Icon name="fast-forward" size={13} color={colors.primary} />
+        <Text style={styles.capabilityText}>MTP</Text>
+      </View>}
+      {vision && <View style={styles.capabilityBadge} accessibilityLabel="Vision">
+        <Icon name="eye" size={13} color={colors.info} />
+      </View>}
+      {capabilities?.tools && <View style={styles.capabilityBadge} accessibilityLabel={capabilities.predicted ? 'Tool calling likely' : 'Tool calling'}>
+        <Icon name="tool" size={13} color={colors.warning} />
+      </View>}
+      {capabilities?.thinking && <View style={styles.capabilityBadge} accessibilityLabel={capabilities.predicted ? 'Thinking likely' : 'Thinking'}>
+        <Icon name="zap" size={13} color={colors.primary} />
+      </View>}
+    </View>
+  );
+};
 
 /**
  * The ONE description string a card shows: the model's description plus any
@@ -322,6 +355,8 @@ export const ModelInfoBadges: React.FC<ModelInfoBadgesProps> = ({
 // ── Action icon buttons (download / select / delete) ──
 
 interface ModelCardActionsProps {
+  /** Names the icon buttons for screen readers ("Download <name>"). */
+  modelName?: string;
   isDownloaded: boolean | undefined;
   isDownloading: boolean | undefined;
   isQueued?: boolean;
@@ -383,7 +418,7 @@ function DownloadedActions({ isActive, testID, colors, styles, onSelect, onDelet
 }
 
 export const ModelCardActions: React.FC<ModelCardActionsProps> = ({
-  isDownloaded, isDownloading, isQueued, isPaused, isActive, isCompatible,
+  modelName, isDownloaded, isDownloading, isQueued, isPaused, isActive, isCompatible,
   testID, onDownload, onSelect, onDelete, onRepairVision, isRepairingVision, onCancel, onPause, onResume,
 }) => {
   const { colors } = useTheme();
@@ -398,7 +433,7 @@ export const ModelCardActions: React.FC<ModelCardActionsProps> = ({
     </>;
   }
   if (!isDownloaded && onDownload) {
-    return <ActionButton icon="download" color={colors.primary} haptic="impactLight" onPress={onDownload} disabled={!isCompatible} testID={tid('download')} styles={styles} />;
+    return <ActionButton icon="download" color={colors.primary} haptic="impactLight" onPress={onDownload} disabled={!isCompatible} testID={tid('download')} accessibilityLabel={modelName ? `Download ${modelName}` : 'Download model'} styles={styles} />;
   }
   if (isDownloaded) {
     return <DownloadedActions isActive={isActive} testID={testID} colors={colors} styles={styles} onSelect={onSelect} onDelete={onDelete} onRepairVision={onRepairVision} isRepairingVision={isRepairingVision} />;

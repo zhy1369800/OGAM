@@ -1,6 +1,7 @@
 import RNFS from 'react-native-fs';
 import { guessStyle, HFImageModel } from '../../services/huggingFaceModelBrowser';
 import { ModelInfo, ImageModelRecommendation, SoCInfo } from '../../types';
+import { mtpHeadForModel } from '@offgrid/models';
 import { ImageModelDescriptor, ModelTypeFilter } from './types';
 import { imageBackendLabel } from '../../utils/imageBackend';
 import { looksLikeVisionModel } from '../../utils/visionModel';
@@ -155,4 +156,28 @@ export function hfModelToDescriptor(
     repo: hfModel.repo,
     attentionVariant: hfModel._coremlAttentionVariant,
   };
+}
+
+/**
+ * What makes a model fast for its size, shown as badges: a mixture-of-experts model's active size
+ * (it runs like a model that small) and a published MTP head (it drafts ahead, so replies come
+ * faster).
+ */
+export function modelSpeedBadges(model: Pick<ModelInfo, 'id' | 'activeParams'>): { moeActiveB?: number; mtp?: boolean } {
+  return {
+    ...(model.activeParams ? { moeActiveB: model.activeParams } : {}),
+    ...(mtpHeadForModel(model.id) ? { mtp: true } : {}),
+  };
+}
+
+/**
+ * The facts a model card states beyond its size, the same words the desktop uses: a newer model
+ * that replaces it, a research licence, and how many other uploads of it there are.
+ */
+export function modelFactChips(model: Pick<ModelInfo, 'newer' | 'nonCommercial' | 'variants'>): string[] {
+  return [
+    model.newer ? `Newer: ${model.newer}` : undefined,
+    model.nonCommercial ? 'Research licence' : undefined,
+    model.variants?.length ? `+${model.variants.length} uploads` : undefined,
+  ].filter((chip): chip is string => !!chip);
 }

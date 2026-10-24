@@ -75,66 +75,118 @@ export async function performMmProjRepairDownload(opts: MmProjRepairDownloadOpts
   }
   // Same quant-independent name the normal download uses — repair and download must agree on the file.
   const mmProjLocalPath = `${modelsDir}/${mmProjLocalName(file.name, file.mmProjFile?.name)}`;
-  const totalBytes = mmProjFile.size;
-  if (await RNFS.exists(mmProjLocalPath)) await RNFS.unlink(mmProjLocalPath).catch(() => {});
+  return performSidecarDownload({
+    modelId, modelKey, quantization: file.quantization ?? '', localPath: mmProjLocalPath,
+    sidecar: { name: mmProjFile.name, url: mmProjFile.downloadUrl, sizeBytes: mmProjFile.size },
+    onProgress, onDownloadIdReady,
+  });
+}
 
+export interface SidecarDownloadOpts {
+  modelId: string;
+  /** The installed model's key: the download-store row the progress bar reads. */
+  modelKey: string;
+  quantization: string;
+  localPath: string;
+  sidecar: { name: string; url: string; sizeBytes: number; sha256?: string };
+  onProgress?: DownloadProgressCallback;
+  onDownloadIdReady?: (id: string) => void;
+}
+
+export interface CompanionFileOpts {
+  modelId: string;
+  file: { name: string; url: string; sizeBytes: number; sha256?: string };
+  localPath: string;
+  onBytes?: (bytesDownloaded: number, downloadId: string) => void;
+  onDownloadIdReady?: (id: string) => void;
+}
+
+/**
+ * Fetch one file of a model's job (a split model's later part, an MTP head, a vision projector) to its
+ * place beside the model. The native downloader resumes on Android and verifies the checksum when one
+ * is given. Resolves with the local path; rejects when the download fails.
+ */
+export async function downloadCompanionFile(opts: CompanionFileOpts): Promise<string> {
+  const { modelId, file, localPath, onBytes, onDownloadIdReady } = opts;
+  if (await RNFS.exists(localPath)) await RNFS.unlink(localPath).catch(() => {});
   const info = await backgroundDownloadService.startDownload({
-    url: mmProjFile.downloadUrl,
-    fileName: mmProjFile.name,
+    url: file.url,
+    fileName: file.name,
     modelId,
-    totalBytes,
+    totalBytes: file.sizeBytes,
+    ...(file.sha256 ? { sha256: file.sha256 } : {}),
   });
   onDownloadIdReady?.(info.downloadId);
-
-  useDownloadStore.getState().add({
-    modelKey,
-    downloadId: info.downloadId,
-    modelId,
-    fileName: mmProjFile.name,
-    quantization: file.quantization ?? '',
-    modelType: 'text',
-    status: 'running',
-    bytesDownloaded: 0,
-    totalBytes,
-    combinedTotalBytes: totalBytes,
-    progress: 0,
-    createdAt: Date.now(),
-  });
-
-  let resolvedPath = mmProjLocalPath;
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const removeProgress = backgroundDownloadService.onProgress(info.downloadId, (event) => {
-        useDownloadStore.getState().updateProgress(info.downloadId, event.bytesDownloaded, totalBytes);
-        onProgress?.({
-          downloadId: info.downloadId,
-          modelId,
-          fileName: mmProjFile.name,
-          bytesDownloaded: event.bytesDownloaded,
-          totalBytes,
-          progress: totalBytes > 0 ? event.bytesDownloaded / totalBytes : 0,
-        });
-      });
-      const removeComplete = backgroundDownloadService.onComplete(info.downloadId, async (event) => {
-        removeProgress(); removeComplete(); removeError();
-        try {
-          resolvedPath = await backgroundDownloadService.moveCompletedDownload(info.downloadId, mmProjLocalPath);
-        } catch {
-          resolvedPath = event.localUri?.replace('file://', '') || mmProjLocalPath;
-        }
-        useDownloadStore.getState().setCompleted(info.downloadId);
-        resolve();
-      });
-      const removeError = backgroundDownloadService.onError(info.downloadId, (err) => {
-        removeProgress(); removeComplete(); removeError();
-        useDownloadStore.getState().setStatus(info.downloadId, 'failed', { message: err.reason || 'Download failed' });
-        reject(new Error(err.reason || 'Download failed'));
-      });
-      backgroundDownloadService.startProgressPolling();
+  return new Promise<string>((resolve, reject) => {
+    const removeProgress = backgroundDownloadService.onProgress(info.downloadId, (event) => {
+      onBytes?.(event.bytesDownloaded, info.downloadId);
     });
-    return resolvedPath;
+    const removeComplete = backgroundDownloadService.onComplete(info.downloadId, async (event) => {
+      removeProgress(); removeComplete(); removeError();
+      let resolvedPath = localPath;
+      try {
+        resolvedPath = await backgroundDownloadService.moveCompletedDownload(info.downloadId, localPath);
+      } catch {
+        resolvedPath = event.localUri?.replace('file://', '') || localPath;
+      }
+      resolve(resolvedPath);
+    });
+    const removeError = backgroundDownloadService.onError(info.downloadId, (err) => {
+      removeProgress(); removeComplete(); removeError();
+      reject(new Error(err.reason || 'Download failed'));
+    });
+    backgroundDownloadService.startProgressPolling();
+  });
+}
+
+/**
+ * Download one extra file beside an installed model (a vision projector, an MTP head), routing
+ * progress through the model's own download-store row so the existing progress bar shows it. The row
+ * is transient and removed once the download settles. Returns the local path.
+ */
+export async function performSidecarDownload(opts: SidecarDownloadOpts): Promise<string> {
+  const { modelId, modelKey, sidecar, localPath, onProgress, onDownloadIdReady } = opts;
+  const totalBytes = sidecar.sizeBytes;
+  try {
+    return await downloadCompanionFile({
+      modelId,
+      file: sidecar,
+      localPath,
+      onDownloadIdReady: (downloadId) => {
+        onDownloadIdReady?.(downloadId);
+        useDownloadStore.getState().add({
+          modelKey,
+          downloadId,
+          modelId,
+          fileName: sidecar.name,
+          quantization: opts.quantization,
+          modelType: 'text',
+          status: 'running',
+          bytesDownloaded: 0,
+          totalBytes,
+          combinedTotalBytes: totalBytes,
+          progress: 0,
+          createdAt: Date.now(),
+        });
+      },
+      onBytes: (bytesDownloaded, downloadId) => {
+        useDownloadStore.getState().updateProgress(downloadId, bytesDownloaded, totalBytes);
+        onProgress?.({
+          downloadId,
+          modelId,
+          fileName: sidecar.name,
+          bytesDownloaded,
+          totalBytes,
+          progress: totalBytes > 0 ? bytesDownloaded / totalBytes : 0,
+        });
+      },
+    });
+  } catch (error) {
+    const row = useDownloadStore.getState().downloads[modelKey];
+    if (row) useDownloadStore.getState().setStatus(row.downloadId, 'failed', { message: (error as Error).message });
+    throw error;
   } finally {
-    // The repair row is transient — remove it once settled so the completed model
+    // The sidecar row is transient — remove it once settled so the completed model
     // (rebuilt via loadDownloadedModels) is the only surviving row.
     useDownloadStore.getState().remove(modelKey);
   }
@@ -236,6 +288,9 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
 
   const mmProjSize = file.mmProjFile?.size || 0;
   const combinedTotalBytes = file.size + mmProjSize;
+  // A split model's later parts are already on disk (startModelDownload fetches them first); this
+  // transfer is its first part, and `file.size` is the whole model's.
+  const mainBytes = file.parts?.[0]?.size ?? file.size;
   const downloadUrl = file.downloadUrl || huggingFaceService.getDownloadUrl(modelId, file.name);
   const author = modelId.split('/')[0] || 'Unknown';
   const modelKey = makeModelKey(modelId, file.name);
@@ -246,7 +301,10 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
   if (needsMmProj) {
     metadataObj.mmProjFileName = mmProjLocalName(file.name, file.mmProjFile?.name);
     metadataObj.mmProjDownloadUrl = file.mmProjFile?.downloadUrl;
+    metadataObj.mmProjFileSize = file.mmProjFile?.size;
   }
+  // A restart rebuilds the job from this: a split model's parts make it whole again.
+  if (file.parts) metadataObj.parts = file.parts;
   if (skipSizeValidation) metadataObj.skipSizeValidation = true;
   const metadataJson = Object.keys(metadataObj).length > 0 ? JSON.stringify(metadataObj) : undefined;
 
@@ -290,7 +348,7 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
     modelType: 'text',
     quantization: file.quantization,
     combinedTotalBytes,
-    totalBytes: file.size,
+    totalBytes: mainBytes,
     sha256: file.sha256,
     metadataJson,
   });
@@ -300,7 +358,7 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
     fileName: file.name,
     mainDownloadId: downloadInfo.downloadId,
     mmProjDownloadId,
-    totalBytes: file.size,
+    totalBytes: mainBytes,
     combinedTotalBytes,
     needsMmProj,
     mmProjLocalPath,
@@ -330,7 +388,7 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
       modelType: 'text',
       status: 'pending',
       bytesDownloaded: 0,
-      totalBytes: file.size,
+      totalBytes: mainBytes,
       combinedTotalBytes,
       progress: 0,
       createdAt: Date.now(),
@@ -352,7 +410,7 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
 
   backgroundDownloadMetadataCallback?.(downloadInfo.downloadId as any, {
     modelId, fileName: file.name, quantization: file.quantization, author,
-    totalBytes: combinedTotalBytes, mainFileSize: file.size,
+    totalBytes: combinedTotalBytes, mainFileSize: mainBytes,
     mmProjFileName: mmProjLocalPath ? mmProjLocalPath.split('/').pop() : file.mmProjFile?.name, mmProjFileSize: mmProjSize,
     mmProjLocalPath, mmProjDownloadId: mmProjDownloadId as any,
   });
@@ -393,7 +451,7 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
 
   const reportProgress = () => {
     const combinedDownloaded = mainBytesDownloaded + mmProjBytesDownloaded;
-    lastMainMilestone = maybeLogMilestone('main', mainBytesDownloaded, file.size, lastMainMilestone);
+    lastMainMilestone = maybeLogMilestone('main', mainBytesDownloaded, mainBytes, lastMainMilestone);
     if (needsMmProj && mmProjSize > 0) {
       lastMmProjMilestone = maybeLogMilestone('mmproj', mmProjBytesDownloaded, mmProjSize, lastMmProjMilestone);
     }
@@ -421,7 +479,7 @@ async function startBgDownload(opts: StartBgDownloadOpts): Promise<BackgroundDow
             file.name,
             mmProjFileName,
             mainBytesDownloaded,
-            file.size,
+            mainBytes,
             mmProjBytesDownloaded,
             mmProjSize,
           );

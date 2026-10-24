@@ -79,6 +79,19 @@ export function deriveEngineCapabilities(i: CapabilityInputs): EngineCapabilitie
  * cross-engine swap (LiteRT <-> llama) can't leave the previous model resident, without the
  * caller branching on which concrete engine held it. Adding an engine is one entry above (OCP).
  */
+/** Unload every text engine except `keep`: the engine about to load swaps its own model, checking
+ *  the new one fits before it lets the current one go. */
+export async function unloadOtherTextEngines(keep: { unloadModel: () => Promise<void> }): Promise<void> {
+  for (const engine of TEXT_ENGINES) {
+    if (engine === keep) continue;
+    try {
+      await engine.unloadModel();
+    } catch (e) {
+      logger.warn('[engines] text engine unload during switch failed, continuing:', e);
+    }
+  }
+}
+
 export async function unloadAllTextEngines(): Promise<void> {
   for (const engine of TEXT_ENGINES) {
     try {
@@ -128,15 +141,18 @@ export function invalidateActiveConversation(): void {
 
 /**
  * Is this LOCAL text model actually resident on its engine? The per-engine readiness predicate
- * in ONE place: LiteRT tracks only "a model is loaded"; llama must have the SELECTED model's path
- * loaded (a different llama model resident is NOT ready). Callers pass their own model and use
+ * in ONE place: the SELECTED model's file must be the one loaded on its engine (a different model
+ * resident on the same engine is NOT ready). Callers pass their own model and use
  * this instead of branching on engine === 'litert' for readiness.
  */
 export function isModelReady(model: { engine?: string; filePath?: string } | null | undefined): boolean {
   if (!model) return false;
+  // Both engines: ready means THIS model's file is the one loaded. "Any LiteRT model loaded" kept
+  // answering with the previous LiteRT model after the person picked another one.
   return model.engine === 'litert'
-    ? liteRTService.isModelLoaded()
-    : llmService.isModelLoaded() && llmService.getLoadedModelPath() === model.filePath;
+    ? liteRTService.isModelLoaded() && liteRTService.getLoadedModelPath() === model.filePath
+    // llama: a context that stopped answering (backend fault) is not ready — the load replaces it.
+    : llmService.isContextUsable() && llmService.getLoadedModelPath() === model.filePath;
 }
 
 /**
@@ -177,15 +193,19 @@ export function activeTextCapabilities(i: {
   model: DownloadedModel | null | undefined;
 }): EngineCapabilities {
   const litert = i.model && isLiteRTModel(i.model) ? i.model : null;
+  // The live engine speaks for THIS model only when it holds this model's file. Picking a model does
+  // not load it until the next send, so another model can still be resident; reading that one's
+  // capabilities hid Photo and refused images for a vision model picked while a text-only one was loaded.
+  const isThisModelLoaded = !!i.model && isModelReady(i.model);
   return deriveEngineCapabilities({
     isRemote: i.isRemote,
     remoteCaps: i.remoteCaps,
     engine: i.model?.engine,
     liteRTVision: litert ? litert.liteRTVision : undefined,
     liteRTAudio: litert ? litert.liteRTAudio : undefined,
-    liteRTLoaded: liteRTService.isModelLoaded(),
+    liteRTLoaded: !!litert && isThisModelLoaded,
     llama: {
-      loaded: llmService.isModelLoaded(),
+      loaded: i.model?.engine === 'llama' && isThisModelLoaded,
       vision: llmService.getMultimodalSupport()?.vision ?? false,
       audio: false,
       tools: llmService.supportsToolCalling(),

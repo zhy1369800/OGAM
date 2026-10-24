@@ -1,5 +1,7 @@
+import { deleteChatImages, imagesNotDeletedAlert } from '../services/chatImageCleanup';
 import React, { useMemo, useState } from 'react';
-import { View, Text, TouchableOpacity, FlatList, Platform } from 'react-native';
+import { View, Text, TouchableOpacity, FlatList } from 'react-native';
+import { LIST_CLIPPING_PROPS } from '../constants/listClipping';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -19,6 +21,7 @@ import { useChatStore, useProjectStore, useAppStore } from '../stores';
 import { Conversation } from '../types';
 import { RootStackParamList } from '../navigation/types';
 import { KnowledgeBaseSection } from './ProjectDetailKnowledgeBaseSection';
+import { openDocumentPage } from '../components/ChatDocumentsSheet';
 import { formatWhen } from '../utils/localTime';
 import { useConversationPreviewLine } from '../hooks/useConversationPreviewLine';
 import { PROJECT_DELETE_FALLBACK_REASON } from '../stores/projectDeleteOutcome';
@@ -118,7 +121,12 @@ export const ProjectDetailScreen: React.FC = () => {
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: () => deleteConversation(conversation.id),
+          onPress: async () => {
+            setAlertState(hideAlert());
+            const notDeleted = await deleteChatImages(conversation.id);
+            deleteConversation(conversation.id);
+            if (notDeleted > 0) setAlertState(imagesNotDeletedAlert(notDeleted));
+          },
         },
       ]),
     );
@@ -129,6 +137,8 @@ export const ProjectDetailScreen: React.FC = () => {
   const renderChatRightActions = (conversation: Conversation) => (
     <TouchableOpacity
       style={styles.deleteAction}
+      accessibilityRole="button"
+      accessibilityLabel={`Delete ${conversation.title}`}
       onPress={() => handleDeleteChat(conversation)}
     >
       <Icon name="trash-2" size={16} color={colors.error} />
@@ -225,10 +235,9 @@ export const ProjectDetailScreen: React.FC = () => {
               navigation.navigate('KnowledgeBase', { projectId })
             }
             onDocumentPress={doc =>
-              navigation.navigate('DocumentPreview', {
-                filePath: doc.path,
-                fileName: doc.name,
-                fileSize: doc.size,
+              openDocumentPage(navigation, {
+                documentId: doc.document_id,
+                name: doc.name,
               })
             }
           />
@@ -301,7 +310,7 @@ export const ProjectDetailScreen: React.FC = () => {
               renderItem={({ item }) => (
                 <View style={styles.chatItemWrapper}>{renderChat({ item })}</View>
               )}
-              removeClippedSubviews={Platform.OS !== 'android'}
+              {...LIST_CLIPPING_PROPS}
             />
           )}
         </View>

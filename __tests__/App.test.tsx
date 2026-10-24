@@ -150,13 +150,13 @@ jest.mock('../src/utils/debugLogFile', () => ({
 jest.mock('../src/services', () => ({
   hardwareService: {
     getDeviceInfo: jest.fn(() => Promise.resolve({ totalMemory: 8 * 1024 * 1024 * 1024 })),
-    getModelRecommendation: jest.fn(() => ({ maxParameters: 7, recommendedQuantization: 'Q4_K_M' })),
+    getModelRecommendation: jest.fn(() => ({ recommendedQuantization: 'Q4_K_M' })),
   },
   modelManager: mockModelManager,
   authService: {
     hasPassphrase: jest.fn(() => Promise.resolve(false)),
   },
-  ragService: {
+  knowledgeBase: {
     ensureReady: jest.fn(() => Promise.resolve()),
   },
   remoteServerManager: {

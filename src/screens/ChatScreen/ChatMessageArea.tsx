@@ -5,6 +5,7 @@ import {
   Text,
   Platform,
 } from 'react-native';
+import { LIST_CLIPPING_PROPS } from '../../constants/listClipping';
 import { useUiModeStore } from '../../stores/uiModeStore';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useKeyboardVisible } from '../../hooks/useKeyboardVisible';
@@ -21,6 +22,7 @@ import {
 } from '../../components';
 import { AnimatedPressable } from '../../components/AnimatedPressable';
 import { generationService } from '../../services';
+import type { QueueActions } from '../../components/ChatInput/Toolbar';
 import { EmptyChat, ImageProgressIndicator } from './ChatScreenComponents';
 import { getPlaceholderText, useChatScreen } from './useChatScreen';
 import { createStyles } from './styles';
@@ -173,6 +175,14 @@ export const ChatMessageArea: React.FC<ChatMessageAreaProps> = ({
   // restart. Return is intentionally unused — the count is naturally 0 when Pro
   // is inactive (no extensions registered); we only need the re-render.
   const isProActive = useIsProActive();
+  const queueActions: QueueActions = {
+    onSendNow: id => {
+      chat.handleSendQueuedNow(id);
+    },
+    onRemove: id => generationService.removeFromQueue(id),
+    onResume: () => generationService.resumeQueue(),
+    onClear: () => generationService.clearQueue(),
+  };
   const assistantAvailability = useAssistantToolAvailability();
   // extToolCount is the live MCP tool count (the email/calendar extension reports 0
   // here because those live in settings.enabledTools — see EmailCalendarExtension).
@@ -302,7 +312,7 @@ export const ChatMessageArea: React.FC<ChatMessageAreaProps> = ({
             minIndexForVisible: 0,
             autoscrollToTopThreshold: 100,
           }}
-          removeClippedSubviews={Platform.OS !== 'android'}
+          {...LIST_CLIPPING_PROPS}
         />
       )}
       {chat.showScrollToBottom && chat.displayMessages.length > 0 && (
@@ -412,9 +422,8 @@ export const ChatMessageArea: React.FC<ChatMessageAreaProps> = ({
           conversationId={chat.activeConversationId}
           imageModelLoaded={chat.imageModelLoaded}
           onOpenSettings={() => chat.setShowSettingsPanel(true)}
-          queueCount={chat.queueCount}
-          queuedTexts={chat.queuedTexts}
-          onClearQueue={() => generationService.clearQueue()}
+          queue={chat.queue}
+          queueActions={queueActions}
           placeholder={getPlaceholderText({
             hasModel: chat.hasActiveModel,
             isModelLoading: chat.isModelLoading,

@@ -11,8 +11,6 @@ import {
   ImageGenerationState,
   buildToolSystemPromptHint,
   contextCompactionService,
-  ragService,
-  retrievalService,
 } from '../../services';
 import { getToolExtensions } from '../../services/tools/extensions';
 import {
@@ -28,7 +26,6 @@ import { abortPreload } from '../../services/modelPreloader';
 import { modelResidencyManager } from '../../services/modelResidency';
 import { reportModelFailure } from '../../services/modelFailureHandler';
 import { remoteToolCapabilityIssue } from '../../services/toolCapabilityPreflight';
-import { embeddingService } from '../../services/rag/embedding';
 import {
   useChatStore,
   useProjectStore,
@@ -37,6 +34,7 @@ import {
 } from '../../stores';
 import { callHook, HOOKS } from '../../bootstrap/hookRegistry';
 import {
+  DocumentCitation,
   Message,
   MediaAttachment,
   Project,
@@ -48,6 +46,14 @@ import {
 import logger from '../../utils/logger';
 import { deleteChatImages, imagesNotDeletedAlert } from '../../services/chatImageCleanup';
 import { ModelReadyOutcome, ensureReadyOrAlert } from './modelReadiness';
+import { describeTurnStatus } from '@offgrid/rag/documents';
+import {
+  prepareTurnDocuments,
+  turnSources,
+  type TurnDocuments,
+} from '../../services/documents/chatTurn';
+import { useDocumentTurnStatusStore } from '../../services/documents/progressStore';
+import { shownMessages } from '../../utils/chatThread';
 type SetState<T> = Dispatch<SetStateAction<T>>;
 const FALLBACK_RECENT_MESSAGE_COUNT = 2;
 
@@ -168,21 +174,35 @@ function blockedImageForNonVisionModel(
   );
   return true;
 }
-function appendAttachmentText(
-  text: string,
-  attachments?: MediaAttachment[],
-): string {
-  if (!attachments) return text;
-  return attachments
-    .filter(a => a.type === 'document' && a.textContent)
-    .reduce(
-      (acc, doc) =>
-        `${acc}\n\n---\n📄 **Attached Document: ${
-          doc.fileName || 'document'
-        }**\n\`\`\`\n${doc.textContent}\n\`\`\`\n---`,
-      text,
-    );
+/** The model said the request did not fit its context window. */
+function isContextOverflowError(error: unknown): boolean {
+  const msg = (error as { message?: string } | null)?.message || String(error ?? '');
+  return (
+    contextCompactionService.isContextFullError(error) ||
+    msg.includes('too long') ||
+    msg.includes('Exceeding the maximum number of tokens') ||
+    msg.includes('Input token ids')
+  );
 }
+
+/** The answer's [S#] tags resolve against the passages it was given: keep them on the reply. */
+function attachDocumentSources(conversationId: string, sources: DocumentCitation[]): void {
+  if (!sources.length) return;
+  useChatStore.setState(state => ({
+    conversations: state.conversations.map(conversation => {
+      if (conversation.id !== conversationId) return conversation;
+      const lastIndex = conversation.messages.map(message => message.role).lastIndexOf('assistant');
+      if (lastIndex < 0) return conversation;
+      return {
+        ...conversation,
+        messages: conversation.messages.map((message, index) =>
+          index === lastIndex ? { ...message, documentSources: sources } : message,
+        ),
+      };
+    }),
+  }));
+}
+
 function buildMessagesForContext(
   conversationId: string,
   messageText: string,
@@ -191,7 +211,8 @@ function buildMessagesForContext(
   const conversation = useChatStore
     .getState()
     .conversations.find(c => c.id === conversationId);
-  const allMessages = (conversation?.messages || []).filter(
+  // The shown thread: each turn's chosen version, never the versions beside it.
+  const allMessages = shownMessages(conversation?.messages || []).filter(
     m => !m.isSystemInfo,
   );
   const { prefix, filtered } = applyCompactionPrefix(
@@ -436,13 +457,14 @@ export async function handleImageGenerationFn(
   // The service reads imageSteps/imageGuidanceScale FRESH from useAppStore.getState() at gen time,
   // exactly as it already does for width/height (which is why size applied immediately and these
   // didn't). Passing nothing here makes all four tunables read from the one fresh source.
-  await imageGenerationService.generateImage({
+  const image = await imageGenerationService.generateImage({
     prompt,
     conversationId,
     previewInterval: 2,
   });
-  // Image gen finishes outside generationService — release any queued messages.
-  generationService.drainQueue();
+  // Image gen finishes outside generationService — release any queued messages. A drawn image is a
+  // finished reply; a stopped or failed one leaves the queue as the Stop or the failure set it.
+  generationService.drainQueue(image ? 'done' : undefined);
 }
 export type StartGenerationCall = {
   setDebugInfo: SetState<any>;
@@ -591,39 +613,58 @@ async function generateWithCompactionRetry(
   }
   return turnInterrupted;
 }
-async function injectRagContext(
-  projectId: string | undefined,
-  query: string,
-  prompt: string,
-): Promise<string> {
-  if (!projectId) return prompt;
+/**
+ * Run a text turn with its documents: the project's knowledge base and every document in the chat,
+ * rebuilt for this question (whole when it fits the time this phone takes to read it, otherwise
+ * ranked passages per file). The status line says what the turn is doing until the model starts.
+ * Token estimates can run short of the real tokenizer, so a prompt that does not fit is retried once
+ * with less document text. Send and resend both run through here, so both answer from the same
+ * documents and both keep their [S#] links.
+ */
+async function generateWithTurnDocuments(opts: {
+  conversationId: string;
+  projectId?: string;
+  question: string;
+  systemPrompt: string;
+  isRemote: boolean;
+  /** The model can search the project's knowledge base this turn, so none of it is preloaded. */
+  knowledgeSearch: boolean;
+  generate: (documents: TurnDocuments | null) => Promise<boolean>;
+}): Promise<boolean> {
+  const status = useDocumentTurnStatusStore.getState();
+  const run = async (documentScale?: number): Promise<boolean> => {
+    let documents: TurnDocuments | null;
+    try {
+      documents = await prepareTurnDocuments({
+        conversationId: opts.conversationId,
+        ...(opts.projectId ? { projectId: opts.projectId } : {}),
+        question: opts.question,
+        systemPrompt: opts.systemPrompt,
+        contextLength:
+          useAppStore.getState().settings.contextLength || APP_CONFIG.maxContextLength,
+        isRemote: opts.isRemote,
+        knowledgeSearch: opts.knowledgeSearch,
+        ...(documentScale ? { documentScale } : {}),
+        onStatus: turnStatus =>
+          status.set(opts.conversationId, describeTurnStatus(turnStatus)),
+      });
+    } catch (error) {
+      logger.warn('[ChatGen] Documents unavailable for this turn:', error);
+      documents = null;
+    } finally {
+      status.set(opts.conversationId, null);
+    }
+    return opts.generate(documents);
+  };
+  let stopped: boolean;
   try {
-    const docs = await ragService.getDocumentsByProject(projectId);
-    const enabledDocs = docs.filter(
-      (d: import('../../services/rag').RagDocument) => d.enabled,
-    );
-    if (enabledDocs.length === 0) return prompt;
-    // Warm up embedding model in background (non-blocking)
-    if (!embeddingService.isLoaded()) {
-      embeddingService
-        .load()
-        .catch(err => logger.error('[RAG] Embedding warmup failed', err));
-    }
-    const docList = enabledDocs
-      .map((d: import('../../services/rag').RagDocument) => `- ${d.name}`)
-      .join('\n');
-    let kbPrompt = `\n\nYou have a knowledge base with these documents:\n${docList}`;
-    kbPrompt +=
-      '\nUse the search_knowledge_base tool to look up specific information from these documents.';
-    const r = await ragService.searchProject(projectId, query);
-    if (r.chunks.length > 0) {
-      kbPrompt += `\n\n${retrievalService.formatForPrompt(r)}`;
-    }
-    return prompt + kbPrompt;
-  } catch (err) {
-    logger.error('[RAG] Context injection failed', err);
+    stopped = await run();
+  } catch (error) {
+    if (!turnSources(opts.conversationId).length || !isContextOverflowError(error)) throw error;
+    stopped = await run(0.75);
   }
-  return prompt;
+  attachDocumentSources(opts.conversationId, turnSources(opts.conversationId));
+  return stopped;
 }
 /** Gemma 4 E2B/E4B need <|think|> prepended to activate thinking mode — both llama.cpp and LiteRT.
  *  The engine-specific decision lives in engines.wantsLeadingThinkToken (the seam), not here. */
@@ -704,11 +745,7 @@ export async function startGenerationFn(
     conversation,
     messageText,
   );
-  let basePrompt = await injectRagContext(
-    conversation?.projectId,
-    messageText,
-    rawPrompt,
-  );
+  let basePrompt = rawPrompt;
 
   // In voice/audio mode the pro audio feature augments the prompt for spoken
   // output. No-op (returns undefined) in free builds.
@@ -733,32 +770,42 @@ export async function startGenerationFn(
     deps.activeModel,
     { isRemote },
   );
-  const messagesForContext = buildMessagesForContext(
-    targetConversationId,
-    messageText,
-    systemPrompt,
-  );
   try {
-    turnStopped = await generateWithCompactionRetry(
-      {
-        id: targetConversationId,
-        prompt: systemPrompt,
-        messages: messagesForContext,
-        setDebugInfo,
-        assistantEnabled,
+    // The stable part of the documents follows the system prompt; this turn's passages sit beside
+    // the question.
+    turnStopped = await generateWithTurnDocuments({
+      conversationId: targetConversationId,
+      projectId: conversation?.projectId,
+      question: messageText,
+      systemPrompt,
+      isRemote,
+      knowledgeSearch: activeTools.includes('search_knowledge_base'),
+      generate: documents => {
+        const promptWithDocuments = documents?.stable
+          ? `${systemPrompt}\n\n${documents.stable}`
+          : systemPrompt;
+        return generateWithCompactionRetry(
+          {
+            id: targetConversationId,
+            prompt: promptWithDocuments,
+            messages: buildMessagesForContext(
+              targetConversationId,
+              documents?.turn ? `${documents.turn}\n\n${messageText}` : messageText,
+              promptWithDocuments,
+            ),
+            setDebugInfo,
+            assistantEnabled,
+          },
+          activeTools,
+          conversation?.projectId,
+        );
       },
-      activeTools,
-      conversation?.projectId,
-    );
+    });
   } catch (error: any) {
     const msg =
       error?.message || error?.toString?.() || 'Failed to generate response';
     logger.error('[ChatGen] Generation failed:', msg, error);
-    const isContextOverflow =
-      contextCompactionService.isContextFullError(error) ||
-      msg.includes('too long') ||
-      msg.includes('Exceeding the maximum number of tokens') ||
-      msg.includes('Input token ids');
+    const isContextOverflow = isContextOverflowError(error);
     if (isContextOverflow) {
       deps.setAlertState({
         ...showAlert(
@@ -915,7 +962,9 @@ async function dispatchResolvedTurn(
       return { handled: true };
     }
   }
-  let messageText = appendAttachmentText(opts.text, opts.attachments);
+  // Documents are not pasted into the question: the document index gives the model what fits
+  // (services/documents/chatTurn), in this turn and every later one.
+  let messageText = opts.text;
   if (shouldGenerateImage && !deps.activeImageModel)
     messageText = `[User wanted an image but no image model is loaded] ${messageText}`;
   return { handled: false, messageText };
@@ -940,7 +989,7 @@ export async function dispatchGenerationFn(
   startTextGeneration: (convId: string, messageText: string, assistantEnabled?: boolean) => Promise<void>,
 ): Promise<void> {
   const { text, attachments, conversationId, imageMode = 'auto', assistantEnabled } = call;
-  const messageTextForRoute = appendAttachmentText(text, attachments);
+  const messageTextForRoute = text;
   // [ROUTE-SM]: confirms the turn reached the router (esp. the voice path) + the
   // final routed destination — so a "pipeline never triggered" is visible in logs.
   logger.log(
@@ -979,6 +1028,8 @@ export type SendCall = {
   attachments?: MediaAttachment[];
   imageMode?: 'auto' | 'force' | 'disabled';
   assistantEnabled?: boolean;
+  /** While a reply runs: stop it and send this message at once instead of queueing it. */
+  sendNow?: boolean;
   startGeneration: (convId: string, text: string, assistantEnabled?: boolean) => Promise<void>;
   setDebugInfo: SetState<any>;
 };
@@ -1014,11 +1065,12 @@ export async function handleSendFn(
     generationService.getState().isGenerating ||
     imageGenerationService.getState().isGenerating
   ) {
-    const messageText = appendAttachmentText(text, attachments);
+    const messageText = text;
     // Carry the user's forced modality through the queue so a queued force-image send is dispatched as
     // image on drain — not re-decided at 'auto' by resolveTurnKind (#510).
+    const queuedId = nextMsgId();
     generationService.enqueueMessage({
-      id: nextMsgId(),
+      id: queuedId,
       conversationId: targetConversationId,
       text,
       attachments,
@@ -1026,6 +1078,7 @@ export async function handleSendFn(
       imageMode,
       assistantEnabled,
     });
+    if (call.sendNow) await sendQueuedNowFn(deps, queuedId);
     return;
   }
   await dispatchGenerationFn(
@@ -1033,6 +1086,21 @@ export async function handleSendFn(
     { text, attachments, conversationId: targetConversationId, imageMode, assistantEnabled },
     startGeneration,
   );
+}
+/**
+ * Send one queued message at once: it moves to the front, the running reply (text or image) stops,
+ * and the stop's drain sends it on its own. With nothing running it goes straight away.
+ */
+export async function sendQueuedNowFn(
+  deps: Pick<GenerationDeps, 'isGeneratingImage'>,
+  id: string,
+): Promise<void> {
+  generationService.sendQueuedNow(id);
+  const running =
+    generationService.getState().isGenerating ||
+    imageGenerationService.getState().isGenerating;
+  if (running) await handleStopFn(deps);
+  else generationService.drainQueue();
 }
 export async function handleStopFn(
   deps: Pick<GenerationDeps, 'isGeneratingImage'>,
@@ -1113,10 +1181,7 @@ export async function regenerateResponseFn(
   // the existing thinking loader covers the full wait instead of appearing only when generation starts.
   generationSession.begin(targetConversationId);
   await modelResidencyManager.reclaimSttForGeneration(); // free idle Whisper before the LLM reload (memory-tight)
-  const messageTextForRoute = appendAttachmentText(
-    userMessage.content,
-    userMessage.attachments,
-  );
+  const messageTextForRoute = userMessage.content;
   // Same decision seam as dispatch (resolveTurnKind): a replay passes the RECORDED kind, which wins
   // verbatim — an image turn re-runs the image pipeline, NEVER re-classifies to text and fails to
   // load a text model (the 1★ resend bug). Only a legacy turn with no recorded kind classifies.
@@ -1168,7 +1233,7 @@ export async function regenerateResponseFn(
   const conversation = useChatStore
     .getState()
     .conversations.find(c => c.id === targetConversationId);
-  const messages = (conversation?.messages || []).filter(
+  const messages = shownMessages(conversation?.messages || []).filter(
     (m: Message) => !m.isSystemInfo,
   );
   const messagesUpToUser = messages
@@ -1181,45 +1246,59 @@ export async function regenerateResponseFn(
   );
   const isRemote = !!useRemoteServerStore.getState().activeRemoteTextModelId;
   const activeTools = enabledTools;
-  const basePrompt = await injectRagContext(
-    conversation?.projectId,
-    messageText,
-    rawPrompt,
-  );
   const useTextHint = !isRemote && !localToolSupport && activeTools.length > 0;
   // MCP/extension hints come solely from augmentSystemPromptForTools in the tool loop
   // (see the send path above) — adding them here too would double-inject.
   const systemPrompt = applyGemma4ThinkToken(
     useTextHint
-      ? `${basePrompt}${buildToolSystemPromptHint(activeTools)}`
-      : basePrompt,
+      ? `${rawPrompt}${buildToolSystemPromptHint(activeTools)}`
+      : rawPrompt,
     deps.activeModel,
     { isRemote },
   );
-  const { prefix, filtered } = applyCompactionPrefix(
-    conversation,
-    systemPrompt,
-    messagesUpToUser,
-  );
   try {
-    await generateWithCompactionRetry(
-      {
-        id: targetConversationId,
-        prompt: systemPrompt,
-        messages: [...prefix, ...filtered],
-        setDebugInfo,
-        assistantEnabled,
+    // Same documents as send: the project's knowledge base and the chat's attachments, rebuilt for
+    // this question, with the same retry and the same [S#] links on the reply.
+    await generateWithTurnDocuments({
+      conversationId: targetConversationId,
+      projectId: conversation?.projectId,
+      question: messageText,
+      systemPrompt,
+      isRemote,
+      knowledgeSearch: activeTools.includes('search_knowledge_base'),
+      generate: documents => {
+        const promptWithDocuments = documents?.stable
+          ? `${systemPrompt}\n\n${documents.stable}`
+          : systemPrompt;
+        const turn = documents?.turn;
+        const replay = turn
+          ? messagesUpToUser.map(m =>
+              m.id === userMessage.id
+                ? { ...m, content: `${turn}\n\n${messageText}` }
+                : m,
+            )
+          : messagesUpToUser;
+        const { prefix, filtered } = applyCompactionPrefix(
+          conversation,
+          promptWithDocuments,
+          replay,
+        );
+        return generateWithCompactionRetry(
+          {
+            id: targetConversationId,
+            prompt: promptWithDocuments,
+            messages: [...prefix, ...filtered],
+            setDebugInfo,
+            assistantEnabled,
+          },
+          activeTools,
+          conversation?.projectId,
+        );
       },
-      activeTools,
-      conversation?.projectId,
-    );
+    });
   } catch (error: any) {
     const msg = error?.message || 'Failed to generate response';
-    const isContextOverflow =
-      contextCompactionService.isContextFullError(error) ||
-      msg.includes('too long') ||
-      msg.includes('Exceeding the maximum number of tokens') ||
-      msg.includes('Input token ids');
+    const isContextOverflow = isContextOverflowError(error);
     if (isContextOverflow) {
       deps.setAlertState({
         ...showAlert(

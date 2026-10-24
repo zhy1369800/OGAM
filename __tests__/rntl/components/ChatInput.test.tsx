@@ -46,7 +46,7 @@ const mockProcessDocument = jest.fn(() => Promise.resolve({
 jest.mock('../../../src/services/documentService', () => ({
   documentService: {
     get isSupported() { return mockIsSupported; },
-    get processDocumentFromPath() { return mockProcessDocument; },
+    get attachDocument() { return mockProcessDocument; },
   },
 }));
 
@@ -831,14 +831,14 @@ describe('ChatInput', () => {
       );
     });
 
-    it('shows error alert when processDocumentFromPath fails', async () => {
+    it('shows error alert when attaching the document fails', async () => {
       mockPick.mockResolvedValue([{
         uri: 'file:///mock/bad-file.txt',
         name: 'bad-file.txt',
         type: 'text/plain',
         size: 100,
       }]);
-      mockProcessDocument.mockRejectedValue(new Error('File is too large. Maximum size is 5MB'));
+      mockProcessDocument.mockRejectedValue(new Error('File is too large. Maximum size is 1 GB'));
 
       const result = render(
         <ChatInput {...defaultProps} />
@@ -848,7 +848,7 @@ describe('ChatInput', () => {
 
       await waitFor(() => {
         expect(result.getByText('Error')).toBeTruthy();
-        expect(result.getByText('File is too large. Maximum size is 5MB')).toBeTruthy();
+        expect(result.getByText('File is too large. Maximum size is 1 GB')).toBeTruthy();
       });
 
       mockProcessDocument.mockResolvedValue({
@@ -861,36 +861,6 @@ describe('ChatInput', () => {
       });
     });
 
-    it('handles processDocumentFromPath returning null', async () => {
-      mockPick.mockResolvedValue([{
-        uri: 'file:///mock/null-result.txt',
-        name: 'null-result.txt',
-        type: 'text/plain',
-        size: 100,
-      }]);
-      mockProcessDocument.mockResolvedValue(null as any);
-
-      const result = render(
-        <ChatInput {...defaultProps} />
-      );
-
-      pressAttachDocument(result);
-
-      await waitFor(() => {
-        expect(mockPick).toHaveBeenCalled();
-      });
-
-      expect(result.queryByTestId('attachments-container')).toBeNull();
-
-      mockProcessDocument.mockResolvedValue({
-        id: 'doc-1',
-        type: 'document' as const,
-        uri: 'file:///mock/document.txt',
-        fileName: 'document.txt',
-        textContent: 'File content here',
-        fileSize: 1234,
-      });
-    });
 
     it('keeps attach button enabled during generation', () => {
       const { getByTestId } = render(
@@ -1187,64 +1157,85 @@ describe('ChatInput', () => {
     });
   });
 
-  describe('queue indicator with queuedTexts', () => {
-    it('shows queue count and preview text', () => {
+  describe('queued messages', () => {
+    const queueActions = () => ({
+      onSendNow: jest.fn(),
+      onRemove: jest.fn(),
+      onResume: jest.fn(),
+      onClear: jest.fn(),
+    });
+    const queue = (hold?: 'stop' | 'failure') => ({
+      items: [
+        { id: 'q1', text: 'Hello world' },
+        { id: 'q2', text: 'Another message' },
+      ],
+      hold,
+    });
+
+    it('lists every queued message with its count', () => {
       const { getByTestId, getByText } = render(
-        <ChatInput
-          {...defaultProps}
-          queueCount={2}
-          queuedTexts={['Hello world', 'Another message']}
-          onClearQueue={jest.fn()}
-        />
+        <ChatInput {...defaultProps} queue={queue()} queueActions={queueActions()} />
       );
 
       expect(getByTestId('queue-indicator')).toBeTruthy();
       expect(getByText('2 queued')).toBeTruthy();
       expect(getByText('Hello world')).toBeTruthy();
+      expect(getByText('Another message')).toBeTruthy();
     });
 
-    it('truncates long queued text preview', () => {
-      const longText = 'This is a very long queued message that should be truncated after thirty characters';
+    it('sends one message now, removes one, or clears them all', () => {
+      const actions = queueActions();
       const { getByTestId } = render(
-        <ChatInput
-          {...defaultProps}
-          queueCount={1}
-          queuedTexts={[longText]}
-          onClearQueue={jest.fn()}
-        />
+        <ChatInput {...defaultProps} queue={queue()} queueActions={actions} />
       );
 
-      expect(getByTestId('queue-indicator')).toBeTruthy();
-      // The text should be truncated to 30 chars + '...'
+      fireEvent.press(getByTestId('queued-send-now-1'));
+      expect(actions.onSendNow).toHaveBeenCalledWith('q2');
+      fireEvent.press(getByTestId('queued-remove-0'));
+      expect(actions.onRemove).toHaveBeenCalledWith('q1');
+      fireEvent.press(getByTestId('clear-queue-button'));
+      expect(actions.onClear).toHaveBeenCalled();
     });
 
-    it('shows clear queue button', () => {
-      const onClearQueue = jest.fn();
-      const { getByTestId } = render(
-        <ChatInput
-          {...defaultProps}
-          queueCount={1}
-          queuedTexts={['Test']}
-          onClearQueue={onClearQueue}
-        />
+    it('says why a held queue waits and offers to send it', () => {
+      const actions = queueActions();
+      const { getByText, getByTestId, rerender, queryByTestId } = render(
+        <ChatInput {...defaultProps} queue={queue()} queueActions={actions} />
       );
+      expect(queryByTestId('queue-resume-button')).toBeNull();
 
-      const clearButton = getByTestId('clear-queue-button');
-      fireEvent.press(clearButton);
-
-      expect(onClearQueue).toHaveBeenCalled();
+      rerender(<ChatInput {...defaultProps} queue={queue('failure')} queueActions={actions} />);
+      expect(getByText('Paused after an error')).toBeTruthy();
+      fireEvent.press(getByTestId('queue-resume-button'));
+      expect(actions.onResume).toHaveBeenCalled();
     });
 
-    it('hides queue indicator when queueCount is 0', () => {
+    it('hides the queue when nothing is queued', () => {
       const { queryByTestId } = render(
-        <ChatInput
-          {...defaultProps}
-          queueCount={0}
-          queuedTexts={[]}
-        />
+        <ChatInput {...defaultProps} queue={{ items: [] }} />
       );
 
       expect(queryByTestId('queue-indicator')).toBeNull();
+    });
+  });
+
+  describe('send now', () => {
+    it('long-press on send while a reply runs asks to send now', () => {
+      const onSend = jest.fn();
+      const { getByTestId } = render(
+        <ChatInput {...defaultProps} onSend={onSend} isGenerating onStop={jest.fn()} />
+      );
+      fireEvent.changeText(getByTestId('chat-input'), 'Urgent');
+      fireEvent(getByTestId('send-button'), 'longPress');
+
+      expect(onSend).toHaveBeenCalledWith('Urgent', undefined, 'auto', undefined, true);
+    });
+
+    it('long-press does nothing special when no reply runs', () => {
+      const { getByTestId } = render(<ChatInput {...defaultProps} />);
+      fireEvent.changeText(getByTestId('chat-input'), 'Hello');
+
+      expect(getByTestId('send-button').props.onLongPress).toBeUndefined();
     });
   });
 

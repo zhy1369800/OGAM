@@ -114,7 +114,6 @@ jest.mock('../../../src/services', () => ({
   hardwareService: {
     getDeviceInfo: jest.fn(() => Promise.resolve({ deviceModel: 'Test Device', availableMemory: 8000000000 })),
     getModelRecommendation: jest.fn(() => ({
-      maxParameters: 8,
       recommendedQuantization: 'Q4_K_M',
       recommendedModels: [],
     })),
@@ -133,6 +132,9 @@ jest.mock('../../../src/services', () => ({
     watchDownload: jest.fn(),
     getDownloadedModels: jest.fn(() => Promise.resolve([])),
     getDownloadedImageModels: jest.fn(() => Promise.resolve([])),
+  },
+  activeModelService: {
+    selectTextModel: jest.fn(),
   },
   remoteServerManager: {
     addServer: jest.fn().mockResolvedValue({ id: 'new-server' }),
@@ -212,6 +214,7 @@ jest.mock('react-native-safe-area-context', () => ({
     const { View } = require('react-native');
     return <View {...props}>{children}</View>;
   },
+  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
 }));
 
 jest.mock('react-native-vector-icons/Feather', () => {
@@ -296,7 +299,6 @@ describe('ModelDownloadScreen', () => {
     mockDownloadModelBackground.mockResolvedValue(undefined);
     mockHardwareService.getDeviceInfo.mockResolvedValue({ deviceModel: 'Test Device', availableMemory: 8000000000 });
     mockHardwareService.getModelRecommendation.mockReturnValue({
-      maxParameters: 8,
       recommendedQuantization: 'Q4_K_M',
       recommendedModels: [],
     });
@@ -388,13 +390,14 @@ describe('ModelDownloadScreen', () => {
     const result = render(<AdvancedSetupScreen navigation={mockNavigation} />);
     await flushPromises();
 
-    expect(result.getByTestId('model-card-0')).toBeTruthy();
+    // It is this phone's one-tap pick.
+    expect(result.getByText('Qwen 3.5 0.8B')).toBeTruthy();
   });
 
   it('keeps a curated local option visible on a low-memory device', async () => {
-    mockHardwareService.getTotalMemoryGB.mockReturnValue(1);
+    // The smallest phones sold have 3 GB: Qwen 3.5 0.8B (0.74 GB) still loads there.
+    mockHardwareService.getTotalMemoryGB.mockReturnValue(3);
     mockHardwareService.getModelRecommendation.mockReturnValue({
-      maxParameters: 1.5,
       recommendedQuantization: 'Q4_K_M',
       recommendedModels: [],
     });
@@ -402,7 +405,8 @@ describe('ModelDownloadScreen', () => {
     const result = render(<AdvancedSetupScreen navigation={mockNavigation} />);
     await flushPromises();
 
-    expect(result.getByTestId('model-card-0')).toBeTruthy();
+    // It is this phone's one-tap pick.
+    expect(result.getByText('Qwen 3.5 0.8B')).toBeTruthy();
   });
 
   it('download button triggers handleDownload via background download', async () => {

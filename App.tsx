@@ -16,7 +16,7 @@ import {
   useProExpiryRedirect,
 } from './src/navigation/useProExpiryRedirect';
 import { useTheme } from './src/theme';
-import { hardwareService, modelManager, authService, ragService, remoteServerManager } from './src/services';
+import { hardwareService, modelManager, authService, knowledgeBase, remoteServerManager, llmService } from './src/services';
 import logger from './src/utils/logger';
 import { useAppStore, useAuthStore, useRemoteServerStore, useWhisperStore } from './src/stores';
 import { useDebugLogsStore } from './src/stores/debugLogsStore';
@@ -24,6 +24,7 @@ import { initDebugLogFile, appendDebugLine, stopDebugLogFile } from './src/utils
 import { startStartupMemoryProbe } from './src/services/startupMemoryProbe';
 import { loadProFeatures } from './src/bootstrap/loadProFeatures';
 import { hydrateDownloadStore } from './src/services/downloadHydration';
+import { initModelCatalog } from './src/stores/modelCatalogStore';
 import { initActiveDownloadPersistence } from './src/services/activeDownloadPersistence';
 import { restoreQueuedDownloads } from './src/services/restoreQueuedDownloads';
 import { startLoadPolicySync } from './src/services/loadPolicySync';
@@ -121,6 +122,13 @@ export function DevSyncStrip() {
   );
 }
 
+/** The OS may kill a backgrounded app: keep the open chat's KV state so it resumes warm. */
+function saveChatStateOnBackground(): void {
+  llmService.saveConversationState().catch((error) => {
+    logger.warn('[App] Failed to save chat state on background:', error);
+  });
+}
+
 function App() {
   useEffect(() => () => {
     stopStartupProbe?.();
@@ -175,6 +183,7 @@ function App() {
   // Handle app state changes for auto-lock
   useAppState({
     onBackground: useCallback(() => {
+      saveChatStateOnBackground();
       if (authEnabled) {
         setLastBackgroundTime(Date.now());
         setLocked(true);
@@ -272,6 +281,9 @@ function App() {
 
   const initializeApp = useCallback(async (generation: number) => {
     try {
+      // Models a previous "check for new models" saved. Reads the cache only; off the boot gate.
+      initModelCatalog();
+
       // Ensure persisted download metadata is loaded before restore logic reads it.
       logger.log('[BOOT] app store hydrate');
       await ensureAppStoreHydrated();
@@ -342,7 +354,9 @@ function App() {
       }
 
       // Initialize RAG database tables
-      ragService.ensureReady().catch((err) => logger.error('Failed to initialize RAG service on startup', err));
+      knowledgeBase.ensureReady().catch((err) => logger.error('Failed to open the knowledge base on startup', err));
+      // The document services register for chat deletions (they free index entries no chat uses).
+      import('./src/services/documents').catch((err) => logger.error('Failed to start document services', err));
 
       try {
         // Register the private Pro entitlement provider before the first status

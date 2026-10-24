@@ -38,7 +38,7 @@ export function keepShownPartialOnError(svc: any, conversationId: string): void 
       buildGenerationMetaImpl(svc),
       'failed',
     );
-  svc.resetState();
+  svc.resetState('error');
 }
 type StreamChunk = string | { content?: string; reasoningContent?: string };
 
@@ -176,6 +176,7 @@ function buildBaseGenerationMeta(svc: any): GenerationMeta {
       settings.cacheType,
     ),
     truncated: perf.lastTruncated,
+    endedEarly: perf.lastEndedEarly,
   };
 }
 
@@ -294,7 +295,7 @@ export async function prepareGenerationImpl(
     }
   } catch (error) {
     if (svc.generationAttempt !== attempt) return false;
-    svc.resetState();
+    svc.resetState('error');
     useChatStore.getState().clearStreamingMessage();
     throw error;
   }
@@ -318,7 +319,7 @@ function assertLiteRTImageSupport(
     activeModel?.engine === 'litert' ? activeModel : null;
   if (!liteRTActiveModel?.liteRTVision) {
     chatStore.clearStreamingMessage();
-    svc.resetState();
+    svc.resetState('error');
     throw new Error(
       'This model does not support images. Import it with vision enabled, or remove the image.',
     );

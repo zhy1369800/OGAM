@@ -1,5 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import { View, Text, FlatList, TouchableOpacity, ScrollView } from 'react-native';
+import { LIST_CLIPPING_PROPS } from '../../constants/listClipping';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/Feather';
@@ -60,7 +61,7 @@ export const DownloadManagerScreen: React.FC = () => {
   // a failed row into "downloading" and made this diverge from the ModelsScreen badge
   // (isActiveStatus, which excludes failed). Using the shared isDownloadingStatus makes
   // downloading + queued equal the badge's isActiveStatus set exactly (B7/T001).
-  const activeDownloadingCount = filteredActive.filter(i => isDownloadingStatus(i.status as DownloadStatus)).length;
+  const activeDownloadingCount = filteredActive.filter(i => i.status === 'downloading' || isDownloadingStatus(i.status as DownloadStatus)).length;
   // Failed/retriable rows are shown here as cards; surface their count too so this screen and the
   // ModelsScreen badge agree on "outstanding download work" (badge = downloading + queued + failed).
   const activeFailedCount = filteredActive.filter(i => isFailedStatus(i.status as DownloadStatus)).length;
@@ -97,6 +98,7 @@ export const DownloadManagerScreen: React.FC = () => {
       </View>
 
       <FlatList
+        {...LIST_CLIPPING_PROPS}
         data={[{ key: 'content' }]}
         ListHeaderComponent={renderHeader}
         renderItem={() => (

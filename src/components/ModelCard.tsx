@@ -13,6 +13,8 @@ import {
   ModelInfoBadges,
   ModelCardActions,
   RecommendedConfig,
+  type ModelCardCapabilities,
+  speedHint,
 } from './ModelCardContent';
 import { PAUSED_ICON, QUEUED_ICON } from '../utils/downloadStatusIcon';
 import { formatBytes } from '../utils/formatBytes';
@@ -48,6 +50,8 @@ interface ModelCardProps {
   isActive?: boolean;
   isCompatible?: boolean;
   incompatibleReason?: string;
+  /** A size in words ("Smaller", "Recommended", "Best") shown instead of the quantization name. */
+  sizeLabel?: string;
   testID?: string;
   onPress?: () => void;
   onDownload?: () => void;
@@ -72,7 +76,7 @@ interface ModelCardProps {
   };
   /** Facts the owning surface knows (RAM, remote capabilities, model style). */
   facts?: string[];
-  capabilities?: { tools?: boolean; thinking?: boolean; vision?: boolean; predicted?: boolean };
+  capabilities?: ModelCardCapabilities;
   sourceBadge?: string;
   trailing?: React.ReactNode;
   disabled?: boolean;
@@ -113,7 +117,7 @@ interface ModelCardHeadingProps {
   isActive?: boolean;
   incompatibleReason?: string;
   facts?: string[];
-  capabilities?: { tools?: boolean; thinking?: boolean; vision?: boolean; predicted?: boolean };
+  capabilities?: ModelCardCapabilities;
   sourceBadge?: string;
   nameTestID?: string;
   factsTestID?: string;
@@ -279,6 +283,7 @@ export const ModelCard: React.FC<ModelCardProps> = ({
   isActive,
   isCompatible = true,
   incompatibleReason,
+  sizeLabel,
   testID,
   onPress,
   onDownload,
@@ -331,6 +336,7 @@ export const ModelCard: React.FC<ModelCardProps> = ({
   const actionsInProgress = !!compact && (isDownloading || isQueued || isPaused);
   const actionButtons = !failedState && (
     <ModelCardActions
+      modelName={model.name}
       isDownloaded={isDownloaded}
       isDownloading={isDownloading}
       isQueued={isQueued}
@@ -363,6 +369,7 @@ export const ModelCard: React.FC<ModelCardProps> = ({
       disabled={disabled || !onPress}
       accessibilityRole={onPress ? 'button' : undefined}
       accessibilityLabel={model.name}
+      accessibilityHint={speedHint(capabilities)}
       accessibilityState={{ selected: !!isActive, disabled: !!disabled }}
       testID={testID}
     >
@@ -372,7 +379,7 @@ export const ModelCard: React.FC<ModelCardProps> = ({
             dense={!!useDenseLayout}
             model={model}
             fileSize={fileSize}
-            quantization={quantization}
+            quantization={sizeLabel ? undefined : quantization}
             isVisionModel={isVisionModel}
             supportsAcceleration={supportsAcceleration}
             recommended={recommended}
@@ -381,7 +388,7 @@ export const ModelCard: React.FC<ModelCardProps> = ({
             credibilityInfo={credibilityInfo}
             isActive={isActive}
             incompatibleReason={!isCompatible ? (incompatibleReason ?? 'Too large') : undefined}
-            facts={facts}
+            facts={sizeLabel ? [sizeLabel, ...(facts ?? [])] : facts}
             capabilities={capabilities}
             sourceBadge={sourceBadge}
             nameTestID={nameTestID}

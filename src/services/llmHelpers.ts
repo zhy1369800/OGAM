@@ -1,5 +1,5 @@
 import { initLlama, LlamaContext } from 'llama.rn';
-import { REASONING_BUDGET_AUTO, thinkingBudgetPayload } from '@offgrid/models';
+import { REASONING_BUDGET_AUTO, thinkingBudgetPayload, MOBILE_BACKEND_ROWS, MOBILE_MTP_DRAFT_TOKENS, mobileUseMmap, type MobileBackend } from '@offgrid/models';
 import RNFS from 'react-native-fs';
 import { Platform } from 'react-native';
 import { APP_CONFIG } from '../constants';
@@ -13,17 +13,35 @@ import { HTP_ENABLED } from '../config/featureFlags';
 
 const RESPONSE_RESERVE = 512;
 /** Prompt compaction target. Output length is the user's model-aware maxTokens setting. */
+/**
+ * The device list an NPU (Hexagon HTP) load asks llama.rn for. 'CPU' is the fallback named
+ * explicitly, and it is load-bearing: llama.rn (cpp/jsi/RNLlamaJSI.cpp buildDeviceOverrides +
+ * configureBackendDevices) treats a list that matches NO registered device as "not provided" and
+ * falls back to its Android default, which is every GPU except HTP — the Adreno OpenCL device. So
+ * `['HTP0']` alone on a phone whose Hexagon session did not open (ggml-hexagon drops HTP0 from the
+ * registry when the session probe fails) silently put every layer on OpenCL, and the Adreno driver
+ * killed the app mid-reply. With 'CPU' in the list the same miss resolves to a CPU-only context:
+ * llama.rn never offloads to the CPU device itself, so on a phone where HTP0 exists this list
+ * selects exactly what `['HTP0']` did.
+ */
+export const HTP_DEVICES: readonly string[] = ['HTP0', 'CPU'];
+
+/** Whether an initialised context actually landed on the NPU (llama.rn reports the devices the model uses). */
+function contextUsesHtp(context: LlamaContext): boolean {
+  const devices = (context as unknown as { devices?: unknown }).devices;
+  return Array.isArray(devices) && devices.some(d => typeof d === 'string' && d.startsWith('HTP'));
+}
+
 export const CONTEXT_PROMPT_BUDGET_RATIO = 0.55;
 const DEFAULT_THREADS = 4; // targets performance cores only; over-threading onto efficiency cores (A520) hurts
-const DEFAULT_BATCH = 512;
 const DEFAULT_GPU_LAYERS = Platform.OS === 'ios' ? 99 : 0;
 function getOptimalThreadCount(): number { return DEFAULT_THREADS; }
-function getOptimalBatchSize(): number { return DEFAULT_BATCH; }
-const REPACKABLE_QUANTS = ['q4_0', 'iq4_nl'];
-/** Detect repackable quant formats where disabling mmap improves inference speed. */
-export function shouldDisableMmap(modelPath: string): boolean {
-  if (Platform.OS !== 'android') return false;
-  return REPACKABLE_QUANTS.some(q => modelPath.toLowerCase().includes(q));
+/** nBatch 0 is "auto": the shared backend row's batch (128 on HTP, 512 on CPU, OpenCL, Metal). */
+export function batchForBackend(nBatch: number | undefined, backend: string | undefined): number {
+  if (nBatch) return nBatch;
+  const fallback: MobileBackend = Platform.OS === 'ios' ? 'metal' : 'cpu';
+  const row = MOBILE_BACKEND_ROWS[(backend as MobileBackend) ?? fallback] ?? MOBILE_BACKEND_ROWS[fallback];
+  return row.batch;
 }
 export function hashString(str: string): string {
   let hash = 0;
@@ -76,10 +94,12 @@ export function effectiveCacheType(backend: string | undefined, requested: strin
 
 export function buildModelParams(
   modelPath: string,
-  settings: { nThreads?: number; nBatch?: number; contextLength?: number; flashAttn?: boolean; enableGpu?: boolean; gpuLayers?: number; cacheType?: string; inferenceBackend?: string; speculativeDecoding?: boolean },
+  settings: { nThreads?: number; nBatch?: number; contextLength?: number; flashAttn?: boolean; enableGpu?: boolean; gpuLayers?: number; cacheType?: string; inferenceBackend?: string; speculativeDecoding?: boolean; speculativeDraftMax?: number },
+  /** Facts read from the GGUF header and the device at load time. */
+  load: { fileType?: number | null; totalRamGb?: number; mtpHeadPath?: string; stateCacheBudgetMb?: number } = {},
 ): ModelLoadParams {
   const nThreads = settings.nThreads || getOptimalThreadCount();
-  const nBatch = settings.nBatch || getOptimalBatchSize();
+  const nBatch = batchForBackend(settings.nBatch, settings.inferenceBackend);
   const ctxLen = settings.contextLength || APP_CONFIG.maxContextLength;
   // inferenceBackend takes precedence; fall back to legacy enableGpu flag
   const backend = settings.inferenceBackend;
@@ -98,7 +118,9 @@ export function buildModelParams(
   return {
     baseParams: {
       model: modelPath, use_mlock: false, n_batch: nBatch, n_ubatch: nBatch, n_threads: nThreads,
-      use_mmap: !shouldDisableMmap(modelPath), vocab_only: false, flash_attn_type,
+      // mmap is off on Android for a quant llama.cpp repacks for ARM (read from the GGUF header):
+      // the weights are copied into the repacked layout anyway.
+      use_mmap: mobileUseMmap(Platform.OS === 'android' ? 'android' : 'ios', load.fileType ?? null, load.totalRamGb), vocab_only: false, flash_attn_type,
       // Do NOT force kv_unified — let llama.cpp pick it per architecture. Forcing
       // `true` (a marginal single-seq perf tweak) hung gemma3n (gemma-4 E2B/E4B):
       // its interleaved sliding-window + heterogeneous KV layers froze building the
@@ -110,7 +132,15 @@ export function buildModelParams(
       // is named on purpose: MTP models carry their own draft layers, and llama.rn falls back to
       // the target model's embedded ones when `draft` is omitted. A model without MTP weights
       // simply never drafts, so the flag is safe to leave on for models that can't use it.
-      ...(settings.speculativeDecoding ? { speculative: { enabled: true, type: 'mtp' as const } } : {}),
+      // A separately downloaded MTP head is passed as the draft model; llama.cpp's default draft
+      // length is 3, and the person may change it.
+      ...(settings.speculativeDecoding ? {
+        speculative: { enabled: true, type: 'mtp' as const },
+        spec_draft_n_max: settings.speculativeDraftMax || MOBILE_MTP_DRAFT_TOKENS,
+        ...(load.mtpHeadPath ? { model_draft: load.mtpHeadPath } : {}),
+      } : {}),
+      // The cross-turn KV prefix cache (recurrent/hybrid models), sized by free RAM.
+      ...(load.stateCacheBudgetMb !== undefined ? { state_cache_budget_mb: load.stateCacheBudgetMb } : {}),
       ...(backend === INFERENCE_BACKENDS.OPENCL ? {} : { cache_type_k: cacheType, cache_type_v: cacheType }),
     },
     nThreads, nBatch, ctxLen, nGpuLayers,
@@ -194,6 +224,13 @@ export async function initContextWithFallback(
     logger.log(`[LLM] Attempt 1/2: ${isHtp ? 'HTP' : 'GPU'} init (ctx=${contextLength}, gpu_layers=${nGpuLayers})`);
     const gpuInitPromise = initLlama({ ...params, n_ctx: contextLength, n_gpu_layers: nGpuLayers } as any);
     const context = await tryGpuInit(gpuInitPromise, nGpuLayers, isHtp);
+    if (isHtp && nGpuLayers > 0 && !contextUsesHtp(context)) {
+      // The NPU was asked for but no HTP device was registered, so llama.rn resolved the list to
+      // its CPU entry. The context works, on the CPU: report it as the failed accelerator attempt
+      // it is, so the chat says so instead of claiming NPU layers.
+      logger.warn(`[LLM] HTP requested but no HTP device was available (context devices: ${JSON.stringify((context as unknown as { devices?: unknown }).devices ?? [])}) — running on CPU`);
+      return { context, gpuAttemptFailed: true, actualLength: contextLength };
+    }
     logger.log('[LLM] GPU init succeeded');
     return { context, gpuAttemptFailed, actualLength: contextLength };
   } catch (gpuError: any) {
@@ -421,16 +458,42 @@ export function buildCompletionParams(settings: {
     ctx_shift: options?.disableCtxShift ? false : true,
   };
 }
+/** Device shape of a finished llama.rn completion — the fields that say WHY it stopped. */
+export interface CompletionEndFields {
+  interrupted?: boolean;
+  stopped_eos?: boolean;
+  stopped_word?: boolean | string;
+  stopped_limit?: number | boolean;
+  truncated?: boolean;
+  context_full?: boolean;
+  tokens_evaluated?: number;
+  tokens_predicted?: number;
+}
+
 /**
- * Was a completion cut off at the n_predict cap (B15), vs finishing on EOS or being STOPPED? SINGLE
- * truncation verdict for both the plain and tool-loop paths. A user stop is `interrupted:true`
- * (stopped_eos:false) — NOT truncation; only a stopped_limit/truncated hit is (device 2026-07-14).
+ * WHY a llama completion stopped — the ONE verdict every llama path reads.
+ * - 'stopped': the user's Stop (interrupted:true, stopped_eos:false) — never a cut-off.
+ * - 'token-limit': the n_predict cap (B15).
+ * - 'context-full': no room left in the context window.
+ * - 'finished': EOS or a stop word.
+ * - 'ended-early': none of those. llama.rn ends a completion this way when the backend fails a decode
+ *   (iOS forbids Metal work in background: ggml-metal sets has_error, rn-completion sets
+ *   has_next_token=false). That error is sticky on the context, so its next completions are empty.
+ * A result without a boolean stopped_eos is not native-shaped and reads as 'finished' (never guess).
  */
-export function isTruncatedResult(
-  cr: { interrupted?: boolean; stopped_limit?: number | boolean; truncated?: boolean } | null | undefined,
-): boolean {
-  if (!cr || cr.interrupted === true) return false;
-  return cr.stopped_limit === 1 || cr.stopped_limit === true || cr.truncated === true;
+export type CompletionEnd = 'finished' | 'token-limit' | 'stopped' | 'context-full' | 'ended-early';
+
+export function completionEnd(cr: CompletionEndFields | null | undefined, contextLength?: number): CompletionEnd {
+  if (!cr || typeof cr !== 'object') return 'finished';
+  if (cr.interrupted === true) return 'stopped';
+  if (cr.stopped_limit === 1 || cr.stopped_limit === true || cr.truncated === true) return 'token-limit';
+  if (cr.context_full === true) return 'context-full';
+  if (cr.stopped_eos === true || !!cr.stopped_word) return 'finished';
+  if (typeof cr.stopped_eos !== 'boolean') return 'finished';
+  // With ctx_shift off, llama.rn stops at a full window without setting context_full.
+  const used = (cr.tokens_evaluated ?? 0) + (cr.tokens_predicted ?? 0);
+  if (contextLength && used >= contextLength - 1) return 'context-full';
+  return 'ended-early';
 }
 export function recordGenerationStats(
   startTime: number,

@@ -32,6 +32,16 @@ export interface ModelInfo {
   modelType?: 'text' | 'vision' | 'code';
   paramCount?: number;
   minRamGB?: number;
+  /** Active parameters per token, in billions, for a mixture-of-experts model. */
+  activeParams?: number;
+  /** An upload of this model carries an MTP head: replies can come faster. */
+  hasMtp?: boolean;
+  /** A newer model that does this one's job better. */
+  newer?: string;
+  /** Other uploads of the same model (repo ids), shown as one result. */
+  variants?: string[];
+  /** A research (non-commercial) licence. */
+  nonCommercial?: boolean;
 }
 
 export interface ModelFile {
@@ -47,6 +57,9 @@ export interface ModelFile {
     downloadUrl: string;
     sha256?: string;
   };
+  // A model Hugging Face split into several files: every part in order, the first being this file.
+  // `size` is then the whole model's; llama.cpp loads all parts from the first part's path.
+  parts?: Array<{ name: string; size: number; downloadUrl: string; sha256?: string }>;
   // LiteRT-specific: whether this .litertlm file supports vision input. Used by
   // buildDownloadedModel to set liteRTVision on the resulting DownloadedModel.
   // Unset for non-LiteRT files and for LiteRT files imported locally where the
@@ -186,13 +199,23 @@ export interface DeviceInfo {
 }
 
 export interface ModelRecommendation {
-  maxParameters: number;
   recommendedQuantization: string;
   recommendedModels: string[];
   warning?: string;
 }
 
 // Media attachment types
+/** One passage an answer may cite as `[S#]`: which document and page. */
+export interface DocumentCitation {
+  /** "S3" */
+  id: string;
+  documentId: string;
+  name: string;
+  page: number;
+  label?: string;
+  snippet: string;
+}
+
 export interface MediaAttachment {
   id: string;
   type: 'image' | 'document' | 'audio';
@@ -202,6 +225,10 @@ export interface MediaAttachment {
   height?: number;
   fileName?: string;
   textContent?: string; // documents: extracted text
+  /** documents: SHA-256 of the file, its identity in the chat's document index */
+  documentId?: string;
+  /** documents: pages (or text parts) the index read */
+  pageCount?: number;
   fileSize?: number; // documents: file size in bytes
   audioFormat?: 'wav' | 'mp3'; // audio attachments: format for model input
   audioDurationSeconds?: number; // audio attachments: recorded duration in seconds
@@ -260,6 +287,8 @@ export interface GenerationMeta {
   routedToolNames?: string[];
   /** True when the reply was cut off at the n_predict cap without an EOS token (B15). */
   truncated?: boolean;
+  /** True when the reply ended before the model finished, with no cap, Stop or full context (a backend fault). */
+  endedEarly?: boolean;
 }
 
 // Chat-related types
@@ -270,6 +299,13 @@ export interface Message {
    * prompt-only messages may omit it because they never enter the sync log.
    */
   uuid?: string;
+  /** The message this one follows (its uuid); messages with the same parent are versions of each
+   *  other (utils/chatThread). Absent on messages saved before versions. */
+  parent?: string;
+  /** When this version was last chosen (epoch ms); the latest-chosen version is shown. */
+  selectedAt?: number;
+  /** Display only: where this shown message sits among its versions, when it has others. */
+  threadVersions?: { index: number; count: number };
   /** Immutable device attribution for portable Sync records. */
   provenance?: RecordProvenance;
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -290,6 +326,8 @@ export interface Message {
   /** Indicates this is a system info message (model loaded/unloaded, etc.) */
   isSystemInfo?: boolean;
   attachments?: MediaAttachment[];
+  /** ASSISTANT messages: the document passages this answer could cite, in [S#] order. */
+  documentSources?: DocumentCitation[];
   /** Generation duration in milliseconds */
   generationTimeMs?: number;
   /** Metadata about how the message was generated */

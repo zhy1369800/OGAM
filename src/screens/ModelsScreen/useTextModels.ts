@@ -1,13 +1,19 @@
 import { useState, useCallback, useMemo, useEffect } from 'react';
 import { Keyboard, BackHandler } from 'react-native';
-import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import type { RootStackParamList } from '../../navigation/types';
 import { showAlert, hideAlert, AlertState } from '../../components/CustomAlert';
+import { CATALOG, type MobileTextCatalogModel } from '@offgrid/models';
 import { RECOMMENDED_MODELS, TRENDING_FAMILIES, MODEL_ORGS } from '../../constants';
+import { useWithRemoteCatalog } from '../../stores/modelCatalogStore';
 import { useAppStore } from '../../stores';
-import { fileExceedsBudget } from '../../services/memoryBudget';
+import { fileExceedsBudget, textModelBudget } from '../../services/memoryBudget';
 import { useDownloadStore } from '../../stores/downloadStore';
 import { huggingFaceService, modelManager, hardwareService, activeModelService } from '../../services';
 import { startModelDownload } from '../../services/startModelDownload';
+import { hfUploadNeedsNewerEngine } from '../../services/llamaEngineSupport';
+import { loadsOnPhone } from '../../services/devicePicks';
 import { ramFitScore } from '../../utils/recommendedModels';
 import { modelSupportsNpuGpu } from '../../utils/acceleration';
 import { ModelInfo, ModelFile, DownloadedModel } from '../../types';
@@ -53,16 +59,41 @@ function matchesOrgFilter(model: ModelInfo, orgs: string[]): boolean {
   });
 }
 
-function mapCuratedModel(m: typeof RECOMMENDED_MODELS[number], details: Record<string, ModelInfo>): ModelInfo {
+/** Whether a curated model passes the maker, type and size filters. */
+function matchesCuratedFilters(model: MobileTextCatalogModel, filterState: FilterState): boolean {
+  if (filterState.type !== 'all' && model.type !== filterState.type) return false;
+  if (filterState.orgs.length > 0 && !filterState.orgs.includes(model.org)) return false;
+  if (filterState.size !== 'all') {
+    const sizeOpt = SIZE_OPTIONS.find(s => s.key === filterState.size);
+    if (sizeOpt && (model.params < sizeOpt.min || model.params >= sizeOpt.max)) return false;
+  }
+  return true;
+}
+
+/** A curated model a search names: by its name, repo, maker or description. An empty search
+ *  (filters only) names every model. */
+function matchesCatalogSearch(query: string, model: MobileTextCatalogModel): boolean {
+  const needle = query.trim().toLowerCase();
+  return [model.name, model.id, model.org, model.description].some(text => text.toLowerCase().includes(needle));
+}
+
+/** A Q4_K_M download is about 4.8 bits per weight: 0.6 GB per billion parameters. */
+const Q4_BYTES_PER_BILLION_PARAMS = 0.6e9;
+
+function mapCuratedModel(m: MobileTextCatalogModel, details: Record<string, ModelInfo>): ModelInfo {
   const fetched = details[m.id];
-  const curatedFields = { modelType: m.type, paramCount: m.params, minRamGB: m.minRam };
+  const curatedFields = {
+    modelType: m.type, paramCount: m.params, minRamGB: m.minRam,
+    ...(m.activeParams ? { activeParams: m.activeParams } : {}),
+    ...(m.nonCommercial ? { nonCommercial: true } : {}),
+  };
   if (fetched) return { ...fetched, name: m.name, description: m.description, ...curatedFields };
   return { id: m.id, name: m.name, author: m.id.split('/')[0], description: m.description, downloads: -1, likes: 0, tags: [], lastModified: '', files: [], ...curatedFields };
 }
 
-async function fetchRecommendedModelDetails(): Promise<Record<string, ModelInfo>> {
+async function fetchRecommendedModelDetails(recommended: MobileTextCatalogModel[]): Promise<Record<string, ModelInfo>> {
   const details: Record<string, ModelInfo> = {};
-  await Promise.allSettled(RECOMMENDED_MODELS.map(async (m) => {
+  await Promise.allSettled(recommended.map(async (m) => {
     try { details[m.id] = await huggingFaceService.getModelDetails(m.id); }
     catch (e) { logger.warn(`[ModelsScreen] Failed to fetch details for ${m.id}:`, e); }
   }));
@@ -73,8 +104,11 @@ function computeFilteredResults(
   searchResults: ModelInfo[],
   filterState: FilterState,
   ramGB: number,
+  needsNewerEngine: (repoId: string) => boolean,
 ): ModelInfo[] {
   const filtered = searchResults.filter(model => {
+    // An upload of a catalog model this engine cannot load is left out, as its catalog card is.
+    if (needsNewerEngine(model.id)) return false;
     if (filterState.source !== 'all' && model.credibility?.source !== filterState.source) return false;
     if (filterState.type !== 'all' && getModelType(model) !== filterState.type) return false;
     if (!matchesOrgFilter(model, filterState.orgs)) return false;
@@ -85,8 +119,17 @@ function computeFilteredResults(
         if (sizeOpt && (params < sizeOpt.min || params >= sizeOpt.max)) return false;
       }
     }
+    // Only GGUF chat models get the text budget; an image-generation result keeps the strict one.
+    const budget = getModelType(model) === 'image-gen' ? undefined : textModelBudget();
     const filesWithSize = (model.files || []).filter(f => f.size > 0);
-    if (filesWithSize.length > 0 && !filesWithSize.some(f => !fileExceedsBudget(f.size, ramGB))) return false;
+    if (filesWithSize.length > 0) {
+      if (!filesWithSize.some(f => !fileExceedsBudget(f.size, ramGB, budget))) return false;
+    } else {
+      // Search results carry no file sizes: judge by the parameter count instead, so a model that
+      // is Too big for this phone is not offered at all.
+      const params = model.paramCount ?? parseParamCount(model);
+      if (params !== null && fileExceedsBudget(params * Q4_BYTES_PER_BILLION_PARAMS, ramGB, budget)) return false;
+    }
     return true;
   });
   return filtered.map(model => {
@@ -97,6 +140,7 @@ function computeFilteredResults(
 }
 
 export function useTextModels(setAlertState: (s: AlertState) => void) {
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -108,6 +152,8 @@ export function useTextModels(setAlertState: (s: AlertState) => void) {
   const [filterState, setFilterState] = useState<FilterState>(initialFilterState);
   const [textFiltersVisible, setTextFiltersVisible] = useState(false);
   const [recommendedModelDetails, setRecommendedModelDetails] = useState<Record<string, ModelInfo>>({});
+  const recommended = useWithRemoteCatalog('text', RECOMMENDED_MODELS);
+  const catalog = useWithRemoteCatalog('models', CATALOG);
   const repairingVisionIds = useDownloadStore(s => s.repairingVisionIds);
   const setRepairingVision = useDownloadStore(s => s.setRepairingVision);
 
@@ -123,9 +169,13 @@ export function useTextModels(setAlertState: (s: AlertState) => void) {
 
   useEffect(() => {
     let cancelled = false;
-    fetchRecommendedModelDetails().then(d => { if (!cancelled) setRecommendedModelDetails(d); });
+    // Details only enrich the cards: a model whose details fail keeps its catalog name, size and
+    // description (recommendedAsModelInfo), so a failure is logged, not shown.
+    fetchRecommendedModelDetails(recommended)
+      .then(d => { if (!cancelled) setRecommendedModelDetails(d); })
+      .catch(e => logger.warn('[ModelsScreen] Failed to load recommended model details:', e));
     return () => { cancelled = true; };
-  }, []);
+  }, [recommended]);
 
   useFocusEffect(
     useCallback(() => {
@@ -232,7 +282,12 @@ export function useTextModels(setAlertState: (s: AlertState) => void) {
             `${model.name} downloaded but the vision projection file could not be saved. Go to Download Manager and use "Repair Vision" to fix it.`,
           ));
         } else {
-          setAlertState(showAlert('Success', `${model.name} downloaded successfully!`));
+          // A finished download is the model you use next: make it active and offer the chat.
+          activeModelService.selectTextModel(dm.id);
+          setAlertState(showAlert(`${model.name} is ready`, undefined, [
+            { text: 'Later', style: 'cancel' },
+            { text: 'Chat now', onPress: () => { setAlertState(hideAlert()); navigation.navigate('Chat', {}); } },
+          ]));
         }
       },
       onError: (err) => setAlertState(showAlert('Download Failed', getUserFacingDownloadMessage(err.message))),
@@ -310,28 +365,21 @@ export function useTextModels(setAlertState: (s: AlertState) => void) {
   // Computed
   const ramGB = hardwareService.getTotalMemoryGB();
   const deviceRecommendation = useMemo(() => hardwareService.getModelRecommendation(), []);
+  // A curated model is offered when it loads on this phone by the shared fit rule (its download
+  // against the phone budget); one the catalog has no size for falls back to its RAM floor.
+  const fitsThisPhone = useCallback(
+    (m: MobileTextCatalogModel) =>
+      (loadsOnPhone(m.id, ramGB, catalog) ?? m.minRam <= ramGB) && (!m.maxRam || ramGB <= m.maxRam),
+    [ramGB, catalog],
+  );
   const hasActiveFilters = filterState.orgs.length > 0 || filterState.type !== 'all' ||
     filterState.source !== 'all' || filterState.size !== 'all' || filterState.quant !== 'all' ||
     filterState.sort !== 'recommended';
 
-  const filteredResults = useMemo(
-    () => applySort(computeFilteredResults(searchResults, filterState, ramGB), filterState.sort, ramGB),
-    [searchResults, filterState, ramGB],
-  );
-
   const recommendedAsModelInfo = useMemo((): ModelInfo[] => {
-    const maxParams = deviceRecommendation.maxParameters;
-    const models = RECOMMENDED_MODELS
-      .filter(m => m.params <= maxParams && (!m.maxRam || ramGB <= m.maxRam))
-      .filter(m => {
-        if (filterState.type !== 'all' && m.type !== filterState.type) return false;
-        if (filterState.orgs.length > 0 && !filterState.orgs.includes(m.org)) return false;
-        if (filterState.size !== 'all') {
-          const sizeOpt = SIZE_OPTIONS.find(s => s.key === filterState.size);
-          if (sizeOpt && (m.params < sizeOpt.min || m.params >= sizeOpt.max)) return false;
-        }
-        return true;
-      })
+    const models = recommended
+      .filter(m => fitsThisPhone(m))
+      .filter(m => matchesCuratedFilters(m, filterState))
       .map(m => mapCuratedModel(m, recommendedModelDetails));
     const sorted = applySort(models, filterState.sort, ramGB);
     // Prioritize NPU/GPU-accelerable models (LiteRT or Q4_0/Q8_0) to the top of the
@@ -339,18 +387,28 @@ export function useTextModels(setAlertState: (s: AlertState) => void) {
     // the editorial 'recommended' sort — explicit sorts (size/downloads/…) are honored.
     if (filterState.sort !== 'recommended') return sorted;
     return [...sorted].sort((a, b) => Number(modelSupportsNpuGpu(b)) - Number(modelSupportsNpuGpu(a)));
-  }, [deviceRecommendation.maxParameters, filterState.type, filterState.orgs, filterState.size, filterState.sort, recommendedModelDetails, ramGB]);
+  }, [recommended, fitsThisPhone, filterState, recommendedModelDetails, ramGB]);
+
+  // A search lists the curated models it matches first, under the same filters and fit as the
+  // curated list, then Hugging Face results, without repeating a curated model.
+  const filteredResults = useMemo(() => {
+    const named = new Set(recommended.filter(m => matchesCatalogSearch(searchQuery, m)).map(m => m.id));
+    const fromCatalog = recommendedAsModelInfo.filter(model => named.has(model.id));
+    const catalogIds = new Set(fromCatalog.map(model => model.id));
+    const needsNewerEngine = hfUploadNeedsNewerEngine(catalog);
+    const fromHuggingFace = applySort(computeFilteredResults(searchResults, filterState, ramGB, needsNewerEngine), filterState.sort, ramGB);
+    return [...fromCatalog, ...fromHuggingFace.filter(model => !catalogIds.has(model.id))];
+  }, [recommended, recommendedAsModelInfo, catalog, searchQuery, searchResults, filterState, ramGB]);
 
   const trendingAsModelInfo = useMemo((): ModelInfo[] => {
-    const maxParams = deviceRecommendation.maxParameters;
     // Pick the best-fit per family using the same bestFitScore used for "for you" recommendations
     return Object.values(TRENDING_FAMILIES)
-      .map(ids => RECOMMENDED_MODELS
-        .filter(m => ids.includes(m.id) && m.params <= maxParams && (!m.maxRam || ramGB <= m.maxRam))
+      .map(ids => recommended
+        .filter(m => ids.includes(m.id) && fitsThisPhone(m))
         .map(m => mapCuratedModel(m, recommendedModelDetails))
         .sort((a, b) => bestFitScore(a, ramGB) - bestFitScore(b, ramGB))[0])
       .filter((m): m is ModelInfo => Boolean(m));
-  }, [deviceRecommendation.maxParameters, recommendedModelDetails, ramGB]);
+  }, [recommended, fitsThisPhone, recommendedModelDetails, ramGB]);
 
   return {
     searchQuery, setSearchQuery,

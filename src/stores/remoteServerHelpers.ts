@@ -25,8 +25,6 @@ import {
   detectToolCallingCapability,
 } from '../utils/remoteCapabilityDetect';
 import {
-  HTTP_API_KEY_ERROR,
-  keyedHttpEndpoint,
   REMOTE_FETCH_REDIRECT_POLICY,
   remoteAuthorizationHeaders,
 } from '../services/remoteTransportPolicy';
@@ -74,10 +72,13 @@ function modelCategories(model: {
   kind?: unknown;
   architecture?: { input_modalities?: unknown; output_modalities?: unknown };
 }, isOpenRouter = false): RemoteModelCategory[] {
+  // Computer Use specialists (a grounder, a decider) are never chat or media models.
+  if (model.kind === 'grounding_specialist' || model.kind === 'decision_specialist') return [];
   const declared = gatewayCategory(model.kind);
   if (declared) return [declared];
   const outputs = Array.isArray(model.architecture?.output_modalities)
     ? model.architecture.output_modalities : [];
+  if (outputs.includes('decisions')) return [];
   const inputs = Array.isArray(model.architecture?.input_modalities)
     ? model.architecture.input_modalities : [];
   if (outputs.includes('image')) return ['image'];
@@ -379,10 +380,8 @@ export async function fetchModelsFromServer(
       headers,
     });
 
-    // A refused key is an authentication failure, not "this server has no models". On private
-    // HTTP the key is never sent, so the refusal is explained by the HTTPS rule.
+    // A refused key is an authentication failure, not "this server has no models".
     if (response.status === 401 || response.status === 403) {
-      if (keyedHttpEndpoint(server.endpoint, server.apiKey)) throw new Error(HTTP_API_KEY_ERROR);
       throw new RemoteAuthenticationError(response.status);
     }
     if (response.ok) {
@@ -464,14 +463,9 @@ export async function fetchModelsFromServer(
       }
     }
   } catch (error) {
-    // A refusal - including the keyed-HTTP explanation - is a failed discovery, so the saved
-    // model list stays in place instead of being replaced by whatever /api/tags returns.
-    if (error instanceof RemoteAuthenticationError) {
-      // A capability probe refused on private HTTP never carried the key either.
-      if (keyedHttpEndpoint(server.endpoint, server.apiKey)) throw new Error(HTTP_API_KEY_ERROR);
-      throw error;
-    }
-    if (error instanceof Error && error.message === HTTP_API_KEY_ERROR) throw error;
+    // A refusal is a failed discovery, so the saved model list stays in place instead of being
+    // replaced by whatever /api/tags returns.
+    if (error instanceof RemoteAuthenticationError) throw error;
     logger.warn('[RemoteServer] Failed to fetch from /v1/models:', error);
   }
 
@@ -497,11 +491,7 @@ export async function fetchModelsFromServer(
       }
     }
   } catch (error) {
-    if (error instanceof RemoteAuthenticationError) {
-      // On private HTTP the key is never sent, so the refusal is explained by the HTTPS rule.
-      if (keyedHttpEndpoint(server.endpoint, server.apiKey)) throw new Error(HTTP_API_KEY_ERROR);
-      throw error;
-    }
+    if (error instanceof RemoteAuthenticationError) throw error;
     logger.warn('[RemoteServer] Failed to fetch from /api/tags:', error);
   }
 

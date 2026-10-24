@@ -1,10 +1,14 @@
+// rag.db: which files belong to which project's knowledge base. Only membership lives here (name,
+// kept copy, enabled, sync identity, and `document_id`, the file's SHA-256). Reading, chunks,
+// vectors and search live in the shared document index (services/documents), the same one chat
+// attachments use.
+
 import { open } from '@op-engineering/op-sqlite';
 import type { DB } from '@op-engineering/op-sqlite';
-import type { Chunk } from './chunking';
 import logger from '../../utils/logger';
 import { generateId } from '../../utils/generateId';
 
-export interface RagDocument {
+export interface KnowledgeDocument {
   id: number;
   sync_id: string;
   project_id: string;
@@ -13,24 +17,12 @@ export interface RagDocument {
   size: number;
   created_at: string;
   enabled: number;
+  /** SHA-256 of the file: its id in the document index. Null for a row made before ids existed. */
+  document_id: string | null;
 }
 
-export interface RagSearchResult {
-  doc_id: number;
-  name: string;
-  content: string;
-  position: number;
-  score: number;
-}
-
-interface StoredEmbedding {
-  chunk_rowid: number;
-  doc_id: number;
-  name: string;
-  content: string;
-  position: number;
-  embedding: number[];
-}
+const COLUMNS =
+  'id, sync_id, project_id, name, path, size, created_at, enabled, document_id';
 
 class RagDatabase {
   private db: DB | null = null;
@@ -39,8 +31,9 @@ class RagDatabase {
   async ensureReady(): Promise<void> {
     if (this.ready) return;
     try {
-      this.db = open({ name: 'rag.db' });
-      this.db.executeSync(
+      const db = open({ name: 'rag.db' });
+      this.db = db;
+      db.executeSync(
         `CREATE TABLE IF NOT EXISTS rag_documents (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           sync_id TEXT,
@@ -49,58 +42,57 @@ class RagDatabase {
           path TEXT NOT NULL,
           size INTEGER NOT NULL,
           created_at TEXT NOT NULL,
-          enabled INTEGER NOT NULL DEFAULT 1
+          enabled INTEGER NOT NULL DEFAULT 1,
+          document_id TEXT
         )`,
       );
-      const columns = this.db.executeSync(
-        "SELECT name FROM pragma_table_info('rag_documents')",
-      );
-      const hasSyncId = (
-        (columns.rows ?? []) as unknown as { name: string }[]
-      ).some(column => column.name === 'sync_id');
-      if (!hasSyncId) {
-        this.db.executeSync(
-          'ALTER TABLE rag_documents ADD COLUMN sync_id TEXT',
-        );
+      const columns = (
+        (db.executeSync("SELECT name FROM pragma_table_info('rag_documents')")
+          .rows ?? []) as unknown as { name: string }[]
+      ).map(column => column.name);
+      if (!columns.includes('sync_id')) {
+        db.executeSync('ALTER TABLE rag_documents ADD COLUMN sync_id TEXT');
       }
-      const legacyDocuments = this.db.executeSync(
+      if (!columns.includes('document_id')) {
+        db.executeSync('ALTER TABLE rag_documents ADD COLUMN document_id TEXT');
+      }
+      const legacyDocuments = db.executeSync(
         "SELECT id FROM rag_documents WHERE sync_id IS NULL OR sync_id = ''",
       );
       for (const document of (legacyDocuments.rows ?? []) as unknown as {
         id: number;
       }[]) {
-        this.db.executeSync(
-          'UPDATE rag_documents SET sync_id = ? WHERE id = ?',
-          [generateId(), document.id],
-        );
+        db.executeSync('UPDATE rag_documents SET sync_id = ? WHERE id = ?', [
+          generateId(),
+          document.id,
+        ]);
       }
-      this.db.executeSync(
+      db.executeSync(
         'CREATE UNIQUE INDEX IF NOT EXISTS idx_rag_documents_sync_id ON rag_documents(sync_id)',
       );
-      this.db.executeSync(
-        `CREATE TABLE IF NOT EXISTS rag_chunks (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          content TEXT NOT NULL,
-          doc_id INTEGER NOT NULL,
-          position INTEGER NOT NULL,
-          FOREIGN KEY (doc_id) REFERENCES rag_documents(id)
-        )`,
+      // Covers every lookup by project (project_id is its leading column) and the enabled filter.
+      db.executeSync(
+        'CREATE INDEX IF NOT EXISTS idx_rag_documents_project_id_enabled ON rag_documents(project_id, enabled)',
       );
-      this.db.executeSync(
-        `CREATE TABLE IF NOT EXISTS rag_embeddings (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          chunk_rowid INTEGER NOT NULL,
-          doc_id INTEGER NOT NULL,
-          embedding BLOB NOT NULL,
-          FOREIGN KEY (chunk_rowid) REFERENCES rag_chunks(id),
-          FOREIGN KEY (doc_id) REFERENCES rag_documents(id)
-        )`,
+      db.executeSync(
+        'CREATE INDEX IF NOT EXISTS idx_rag_documents_document_id ON rag_documents(document_id)',
       );
+      this.dropOldIndex(db);
       this.ready = true;
     } catch (error) {
       logger.error('[RagDB] Failed to initialize:', error);
       throw error;
     }
+  }
+
+  /** The old engine's chunks and vectors: the document index replaced them. Freed once. */
+  private dropOldIndex(db: DB): void {
+    const old = (db.executeSync(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('rag_chunks', 'rag_embeddings')",
+    ).rows ?? []) as unknown as { name: string }[];
+    if (!old.length) return;
+    db.executeSync('DROP TABLE IF EXISTS rag_embeddings');
+    db.executeSync('DROP TABLE IF EXISTS rag_chunks');
   }
 
   private getDb(): DB {
@@ -109,20 +101,25 @@ class RagDatabase {
     return this.db;
   }
 
+  private rows(sql: string, params: unknown[] = []): KnowledgeDocument[] {
+    return (this.getDb().executeSync(sql, params as never[]).rows ??
+      []) as unknown as KnowledgeDocument[];
+  }
+
   insertDocument(doc: {
     projectId: string;
     name: string;
     path: string;
     size: number;
+    documentId: string;
     syncId?: string;
     createdAt?: string;
     enabled?: boolean;
   }): number {
-    const db = this.getDb();
-    const result = db.executeSync(
+    const result = this.getDb().executeSync(
       `INSERT INTO rag_documents
-        (sync_id, project_id, name, path, size, created_at, enabled)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        (sync_id, project_id, name, path, size, created_at, enabled, document_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         doc.syncId ?? generateId(),
         doc.projectId,
@@ -131,6 +128,7 @@ class RagDatabase {
         doc.size,
         doc.createdAt ?? new Date().toISOString(),
         doc.enabled === false ? 0 : 1,
+        doc.documentId,
       ],
     );
     if (result.insertId == null)
@@ -138,180 +136,78 @@ class RagDatabase {
     return result.insertId;
   }
 
-  insertChunks(docId: number, chunks: Chunk[]): number[] {
-    const db = this.getDb();
-    const rowIds: number[] = [];
-    db.executeSync('BEGIN');
-    try {
-      for (const chunk of chunks) {
-        const result = db.executeSync(
-          'INSERT INTO rag_chunks (content, doc_id, position) VALUES (?, ?, ?)',
-          [chunk.content, docId, chunk.position],
-        );
-        if (result.insertId == null)
-          throw new Error(
-            `Failed to insert chunk at position ${chunk.position}`,
-          );
-        rowIds.push(result.insertId);
-      }
-      db.executeSync('COMMIT');
-    } catch (e) {
-      db.executeSync('ROLLBACK');
-      throw e;
-    }
-    return rowIds;
-  }
-
-  private embeddingToBlob(embedding: number[]): ArrayBuffer {
-    return new Float32Array(embedding).buffer;
-  }
-
-  private blobToEmbedding(blob: any): number[] {
-    if (blob instanceof ArrayBuffer) return Array.from(new Float32Array(blob));
-    if (blob?.buffer instanceof ArrayBuffer)
-      return Array.from(new Float32Array(blob.buffer));
-    return [];
-  }
-
-  insertEmbeddingsBatch(
-    entries: { chunkRowid: number; docId: number; embedding: number[] }[],
-  ): void {
-    const db = this.getDb();
-    db.executeSync('BEGIN');
-    try {
-      for (const entry of entries) {
-        db.executeSync(
-          'INSERT INTO rag_embeddings (chunk_rowid, doc_id, embedding) VALUES (?, ?, ?)',
-          [
-            entry.chunkRowid,
-            entry.docId,
-            this.embeddingToBlob(entry.embedding),
-          ],
-        );
-      }
-      db.executeSync('COMMIT');
-    } catch (e) {
-      db.executeSync('ROLLBACK');
-      throw e;
-    }
-  }
-
-  getEmbeddingsByProject(projectId: string): StoredEmbedding[] {
-    const db = this.getDb();
-    const result = db.executeSync(
-      `SELECT e.chunk_rowid, e.doc_id, d.name, c.content, c.position, e.embedding
-       FROM rag_embeddings e
-       JOIN rag_chunks c ON e.chunk_rowid = c.id
-       JOIN rag_documents d ON e.doc_id = d.id
-       WHERE d.project_id = ? AND d.enabled = 1`,
-      [projectId],
+  setDocumentId(docId: number, documentId: string): void {
+    this.getDb().executeSync(
+      'UPDATE rag_documents SET document_id = ? WHERE id = ?',
+      [documentId, docId],
     );
-    return ((result.rows ?? []) as unknown as any[]).map(row => ({
-      ...row,
-      embedding: this.blobToEmbedding(row.embedding),
-    }));
-  }
-
-  hasEmbeddingsForDocument(docId: number): boolean {
-    const db = this.getDb();
-    const result = db.executeSync(
-      'SELECT COUNT(*) as count FROM rag_embeddings WHERE doc_id = ?',
-      [docId],
-    );
-    const rows = (result.rows ?? []) as unknown as { count: number }[];
-    return rows.length > 0 && rows[0].count > 0;
-  }
-
-  getChunksByDocument(
-    docId: number,
-  ): { id: number; content: string; position: number }[] {
-    const db = this.getDb();
-    const result = db.executeSync(
-      'SELECT id, content, position FROM rag_chunks WHERE doc_id = ? ORDER BY position',
-      [docId],
-    );
-    return (result.rows ?? []) as unknown as {
-      id: number;
-      content: string;
-      position: number;
-    }[];
   }
 
   deleteDocument(docId: number): void {
-    const db = this.getDb();
-    db.executeSync('DELETE FROM rag_embeddings WHERE doc_id = ?', [docId]);
-    db.executeSync('DELETE FROM rag_chunks WHERE doc_id = ?', [docId]);
-    db.executeSync('DELETE FROM rag_documents WHERE id = ?', [docId]);
-  }
-
-  getDocumentsByProject(projectId: string): RagDocument[] {
-    const db = this.getDb();
-    const result = db.executeSync(
-      'SELECT id, sync_id, project_id, name, path, size, created_at, enabled FROM rag_documents WHERE project_id = ? ORDER BY created_at DESC',
-      [projectId],
-    );
-    return (result.rows ?? []) as unknown as RagDocument[];
-  }
-
-  getAllDocuments(): RagDocument[] {
-    const db = this.getDb();
-    const result = db.executeSync(
-      'SELECT id, sync_id, project_id, name, path, size, created_at, enabled FROM rag_documents ORDER BY created_at ASC',
-    );
-    return (result.rows ?? []) as unknown as RagDocument[];
-  }
-
-  getDocument(docId: number): RagDocument | undefined {
-    const db = this.getDb();
-    const result = db.executeSync(
-      'SELECT id, sync_id, project_id, name, path, size, created_at, enabled FROM rag_documents WHERE id = ?',
-      [docId],
-    );
-    return ((result.rows ?? []) as unknown as RagDocument[])[0];
-  }
-
-  getDocumentBySyncId(syncId: string): RagDocument | undefined {
-    const db = this.getDb();
-    const result = db.executeSync(
-      'SELECT id, sync_id, project_id, name, path, size, created_at, enabled FROM rag_documents WHERE sync_id = ?',
-      [syncId],
-    );
-    return ((result.rows ?? []) as unknown as RagDocument[])[0];
-  }
-
-  toggleEnabled(docId: number, enabled: boolean): void {
-    const db = this.getDb();
-    db.executeSync('UPDATE rag_documents SET enabled = ? WHERE id = ?', [
-      enabled ? 1 : 0,
-      docId,
-    ]);
-  }
-
-  getChunksByProject(projectId: string, topK: number = 5): RagSearchResult[] {
-    const db = this.getDb();
-    const result = db.executeSync(
-      `SELECT c.doc_id, d.name, c.content, c.position, 0 as score
-       FROM rag_chunks c JOIN rag_documents d ON c.doc_id = d.id
-       WHERE d.project_id = ? AND d.enabled = 1
-       ORDER BY c.position LIMIT ?`,
-      [projectId, topK],
-    );
-    return (result.rows ?? []) as unknown as RagSearchResult[];
+    this.getDb().executeSync('DELETE FROM rag_documents WHERE id = ?', [docId]);
   }
 
   deleteDocumentsByProject(projectId: string): void {
-    const db = this.getDb();
-    db.executeSync(
-      'DELETE FROM rag_embeddings WHERE doc_id IN (SELECT id FROM rag_documents WHERE project_id = ?)',
-      [projectId],
-    );
-    db.executeSync(
-      'DELETE FROM rag_chunks WHERE doc_id IN (SELECT id FROM rag_documents WHERE project_id = ?)',
-      [projectId],
-    );
-    db.executeSync('DELETE FROM rag_documents WHERE project_id = ?', [
+    this.getDb().executeSync('DELETE FROM rag_documents WHERE project_id = ?', [
       projectId,
     ]);
+  }
+
+  getDocumentsByProject(projectId: string): KnowledgeDocument[] {
+    return this.rows(
+      `SELECT ${COLUMNS} FROM rag_documents WHERE project_id = ? ORDER BY created_at DESC`,
+      [projectId],
+    );
+  }
+
+  getEnabledDocumentsByProject(projectId: string): KnowledgeDocument[] {
+    return this.rows(
+      `SELECT ${COLUMNS} FROM rag_documents WHERE project_id = ? AND enabled = 1 ORDER BY created_at ASC`,
+      [projectId],
+    );
+  }
+
+  getAllDocuments(): KnowledgeDocument[] {
+    return this.rows(
+      `SELECT ${COLUMNS} FROM rag_documents ORDER BY created_at ASC`,
+    );
+  }
+
+  getDocument(docId: number): KnowledgeDocument | undefined {
+    return this.rows(`SELECT ${COLUMNS} FROM rag_documents WHERE id = ?`, [
+      docId,
+    ])[0];
+  }
+
+  getDocumentBySyncId(syncId: string): KnowledgeDocument | undefined {
+    return this.rows(`SELECT ${COLUMNS} FROM rag_documents WHERE sync_id = ?`, [
+      syncId,
+    ])[0];
+  }
+
+  /** Every document id a knowledge base uses, so the document index keeps them. */
+  getAllDocumentIds(): string[] {
+    return (
+      (this.getDb().executeSync(
+        'SELECT DISTINCT document_id FROM rag_documents WHERE document_id IS NOT NULL',
+      ).rows ?? []) as unknown as { document_id: string }[]
+    ).map(row => row.document_id);
+  }
+
+  /** Other rows still pointing at this kept copy (normally none). */
+  countByPath(path: string): number {
+    const [row] = (this.getDb().executeSync(
+      'SELECT COUNT(*) AS count FROM rag_documents WHERE path = ?',
+      [path],
+    ).rows ?? []) as unknown as { count: number }[];
+    return Number(row?.count ?? 0);
+  }
+
+  toggleEnabled(docId: number, enabled: boolean): void {
+    this.getDb().executeSync(
+      'UPDATE rag_documents SET enabled = ? WHERE id = ?',
+      [enabled ? 1 : 0, docId],
+    );
   }
 }
 

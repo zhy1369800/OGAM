@@ -1,3 +1,4 @@
+import { FastestSettingsButton } from '../../components/settings/FastestSettingsButton';
 import React, { useState } from 'react';
 import { Text } from 'react-native';
 import { AdvancedToggle, Card } from '../../components';
@@ -30,6 +31,9 @@ export const TextGenerationSection: React.FC = () => {
           ? 'Configure LiteRT model behavior.'
           : 'Configure LLM behavior for text responses.'}
       </Text>
+
+      {/* The one-tap speed setup comes first; the controls it sets stay under Advanced. */}
+      {!isLiteRT && <FastestSettingsButton />}
 
       {isLiteRT ? (
         <>

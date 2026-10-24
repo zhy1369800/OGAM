@@ -1,5 +1,6 @@
 import React from 'react';
-import { View, Text, Image, TouchableOpacity, FlatList, Platform } from 'react-native';
+import { View, Text, Image, TouchableOpacity, FlatList } from 'react-native';
+import { LIST_CLIPPING_PROPS } from '../../constants/listClipping';
 import Icon from 'react-native-vector-icons/Feather';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
@@ -34,6 +35,7 @@ export const GalleryScreen: React.FC = () => {
     imageGenState,
     displayImages,
     handleDelete,
+    handleRemoveUnavailable,
     toggleSelectMode,
     toggleImageSelection,
     handleDeleteSelected,
@@ -58,6 +60,7 @@ export const GalleryScreen: React.FC = () => {
           setSelectedImage(item);
         }
       }}
+      onRemove={() => handleRemoveUnavailable(item)}
       onLongPress={() => {
         if (!isSelectMode) {
           toggleSelectMode();
@@ -81,6 +84,8 @@ export const GalleryScreen: React.FC = () => {
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.headerButton, selectedIds.size === 0 && styles.headerButtonDisabled]}
+              accessibilityRole="button"
+              accessibilityLabel="Delete selected images"
               onPress={handleDeleteSelected}
               disabled={selectedIds.size === 0}
             >
@@ -169,7 +174,7 @@ export const GalleryScreen: React.FC = () => {
           contentContainerStyle={styles.gridContainer}
           columnWrapperStyle={styles.gridRow}
           showsVerticalScrollIndicator={false}
-          removeClippedSubviews={Platform.OS !== 'android'}
+          {...LIST_CLIPPING_PROPS}
         />
       )}
 

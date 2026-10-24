@@ -1,6 +1,6 @@
 {
   "name": "offgrid-mobile",
-  "version": "0.0.112",
+  "version": "0.0.118",
   "private": true,
   "scripts": {
     "android": "react-native run-android --mode=debug --appId ai.offgridmobile.dev",
@@ -8,7 +8,7 @@
     "ios:device": "./scripts/ios-device.sh",
     "lint": "eslint . && npm run lint:android && npm run lint:ios",
     "lint:android": "cd android && ./gradlew :app:lintDebug",
-    "lint:ios": "swiftlint lint --quiet || echo 'SwiftLint not installed, skipping iOS lint'",
+    "lint:ios": "if command -v swiftlint >/dev/null; then swiftlint lint --quiet; else echo 'SwiftLint not installed, skipping iOS lint'; fi",
     "prepare": "husky && (cd pro && git config core.hooksPath .githooks 2>/dev/null || true)",
     "sonar": "./scripts/run-sonar.sh",
     "start": "react-native start",
@@ -25,10 +25,16 @@
     "e2e:coverage": "node scripts/e2e/collect-coverage.mjs",
     "e2e:build:ios": "E2E_COVERAGE=1 npx react-native run-ios --device",
     "e2e:build:android": "E2E_COVERAGE=1 npx react-native run-android --mode=debug --appId ai.offgridmobile.dev",
-    "test:device-parser": "node --test scripts/android/__tests__/adbClient.test.mjs",
+    "test:device-parser": "node --test scripts/android/__tests__/adbClient.test.mjs scripts/e2e/__tests__/deviceJourney.test.mjs",
     "e2e:mesh": "node --test __tests__/device/meshPairing.e2e.mjs",
     "e2e:image-sync": "node scripts/e2e/generated-image-sync.mjs",
-    "e2e:thinking-sync": "node scripts/e2e/attended-thinking-sync.mjs"
+    "e2e:thinking-sync": "node scripts/e2e/attended-thinking-sync.mjs",
+    "e2e:journeys": "node scripts/e2e/run-journeys.mjs",
+    "e2e:engine-smoke": "node scripts/e2e/engine-smoke-journey.mjs",
+    "e2e:mic-permission": "node scripts/e2e/mic-permission-journey.mjs",
+    "e2e:download-a11y": "node scripts/e2e/download-a11y-journey.mjs",
+    "e2e:branch-fixes": "node scripts/e2e/branch-fixes-journey.mjs",
+    "e2e:crash-smoke": "node scripts/e2e/crash-smoke-journey.mjs"
   },
   "dependencies": {
     "@dr.pogodin/react-native-fs": "^2.38.1",
@@ -54,7 +60,7 @@
     "buffer": "^6.0.3",
     "js-sha256": "^0.11.0",
     "js-sha512": "^0.9.0",
-    "llama.rn": "^0.13.0-rc.4",
+    "llama.rn": "0.13.0-rc.7",
     "node-html-parser": "^7.1.0",
     "patch-package": "^8.0.1",
     "react": "19.2.0",
@@ -74,7 +80,7 @@
     "react-native-keyboard-controller": "^1.21.12",
     "react-native-keychain": "^10.0.0",
     "react-native-qrcode-svg": "^6.3.21",
-    "react-native-reanimated": "^4.2.1",
+    "react-native-reanimated": "~4.3.4",
     "react-native-safe-area-context": "^5.6.2",
     "react-native-screens": "^4.20.0",
     "react-native-svg": "^15.15.3",
@@ -82,7 +88,7 @@
     "react-native-url-polyfill": "^3.0.0",
     "react-native-vector-icons": "^10.3.0",
     "react-native-vision-camera": "^4.7.3",
-    "react-native-worklets": "^0.7.3",
+    "react-native-worklets": "^0.8.3",
     "react-native-zeroconf": "^0.14.0",
     "react-native-zip-archive": "7.1.0",
     "text-encoding-polyfill": "^0.6.7",
@@ -119,6 +125,7 @@
     "memfs": "^4.64.0",
     "prettier": "2.8.8",
     "react-test-renderer": "19.2.0",
+    "semver": "^6.3.1",
     "sonar-scanner": "^3.1.0",
     "typescript": "^5.8.3"
   },
@@ -128,7 +135,9 @@
   "engines": {
     "node": ">=20"
   },
-  "op-sqlite": {},
+  "op-sqlite": {
+    "fts5": true
+  },
   "overrides": {
     "react": "19.2.0",
     "linkify-it": "^5.0.2",

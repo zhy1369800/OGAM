@@ -17,10 +17,54 @@ export function installRealSqlite(setupSql?: string): void {
  * already reset modules (e.g. installNativeBoundary for a mounted-screen RAG test). Call AFTER that installer,
  * before requiring the rag modules. installRealSqlite = resetModules + this.
  */
-export function doMockRealSqlite(setupSql?: string): void {
+export function doMockRealSqlite(
+  setupSql?: string,
+  options: { withoutFts5?: boolean } & RealSqliteDiskOptions = {},
+): void {
   jest.doMock('@op-engineering/op-sqlite', () =>
-    realSqliteModule({ setupSql }),
+    realSqliteModule({ setupSql, ...options }),
   );
+}
+
+/** Opt-in device variations of the op-sqlite boundary. Leaving both out keeps the default behavior. */
+export interface RealSqliteDiskOptions {
+  /**
+   * Keep each database in a file in this directory (named by its op-sqlite `name`), the way the app's
+   * databases live on the phone's disk, so a relaunch (a fresh module graph that opens them again)
+   * finds what the first run wrote. Default: a fresh :memory: database per open().
+   */
+  persistAt?: string;
+  /**
+   * Hand each BLOB back as a Uint8Array view at a non-zero byteOffset into ONE ArrayBuffer shared by
+   * every BLOB of that result (the other rows' bytes sit beside it), as a pooled allocator does. Code
+   * that decodes `blob.buffer` instead of the view's own bytes reads a neighbour's values.
+   * Default: each BLOB is an ArrayBuffer that owns its bytes (op-sqlite 15's shape).
+   */
+  pooledBlobs?: boolean;
+}
+
+/** Copy every BLOB of one result into one shared buffer and answer with views into it. */
+function poolBlobs(rows: Record<string, unknown>[]): void {
+  const blobs: Array<{ row: Record<string, unknown>; key: string; bytes: Uint8Array }> = [];
+  for (const row of rows) {
+    for (const [key, value] of Object.entries(row)) {
+      if (ArrayBuffer.isView(value)) blobs.push({ row, key, bytes: value as Uint8Array });
+    }
+  }
+  if (!blobs.length) return;
+  // Start off a 4-byte boundary and leave a gap between neighbours, so neither the offset nor the
+  // whole-buffer length matches any one BLOB.
+  const LEAD = 3;
+  const GAP = 5;
+  const total = blobs.reduce((sum, blob) => sum + blob.bytes.byteLength + GAP, LEAD);
+  const pool = new ArrayBuffer(total);
+  new Uint8Array(pool).fill(0x7f);
+  let offset = LEAD;
+  for (const blob of blobs) {
+    new Uint8Array(pool, offset, blob.bytes.byteLength).set(blob.bytes);
+    blob.row[blob.key] = new Uint8Array(pool, offset, blob.bytes.byteLength);
+    offset += blob.bytes.byteLength + GAP;
+  }
 }
 
 /**
@@ -30,12 +74,20 @@ export function doMockRealSqlite(setupSql?: string): void {
  * gets the same inert database as the global mock, so code a test is not about keeps its old boundary.
  */
 export function realSqliteModule(
-  options: { setupSql?: string; only?: readonly string[] } = {},
+  options: {
+    setupSql?: string;
+    only?: readonly string[];
+    /** A SQLite build without the FTS5 module (op-sqlite built without `"fts5": true`). */
+    withoutFts5?: boolean;
+  } & RealSqliteDiskOptions = {},
 ): { open: (config?: { name?: string }) => unknown } {
   const { DatabaseSync } = require('node:sqlite');
 
   const wrap = (db: any) => ({
     executeSync: (sql: string, params: unknown[] = []) => {
+      if (options.withoutFts5 && /USING\s+fts5/i.test(sql)) {
+        throw new Error('no such module: fts5');
+      }
       const bind = (params ?? []).map(p =>
         // op-sqlite accepts ArrayBuffer for BLOBs; node:sqlite wants a Uint8Array/Buffer. Use a
         // realm-safe check (Object.prototype.toString) because a composed harness (installNativeBoundary
@@ -55,7 +107,23 @@ export function realSqliteModule(
       }
       const stmt = db.prepare(sql);
       if (/^\s*(SELECT|WITH)\b/i.test(sql)) {
-        const rows = stmt.all(...bind);
+        // op-sqlite hands a BLOB column back as an ArrayBuffer; node:sqlite returns a Uint8Array.
+        // Answer with the device's shape so code reading vectors sees what it sees on a phone.
+        const all = stmt.all(...bind) as Record<string, unknown>[];
+        if (options.pooledBlobs) {
+          poolBlobs(all);
+          return { rows: all, insertId: undefined, rowsAffected: 0 };
+        }
+        const rows = all.map((row: Record<string, unknown>) => {
+          for (const [key, value] of Object.entries(row)) {
+            // isView, not instanceof: node:sqlite builds its Uint8Array in another JS realm.
+            if (ArrayBuffer.isView(value)) {
+              const bytes = value as Uint8Array;
+              row[key] = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            }
+          }
+          return row;
+        });
         return { rows, insertId: undefined, rowsAffected: 0 };
       }
       const info = stmt.run(...bind);
@@ -88,7 +156,9 @@ export function realSqliteModule(
     open: (config?: { name?: string }) => {
       if (options.only && !options.only.includes(config?.name ?? ''))
         return inert();
-      const db = new DatabaseSync(':memory:');
+      const db = new DatabaseSync(
+        options.persistAt ? require('node:path').join(options.persistAt, config?.name ?? 'default.db') : ':memory:',
+      );
       if (options.setupSql) db.exec(options.setupSql);
       return wrap(db);
     },

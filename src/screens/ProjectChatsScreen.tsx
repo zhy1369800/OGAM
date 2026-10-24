@@ -1,11 +1,12 @@
+import { deleteChatImages, imagesNotDeletedAlert } from '../services/chatImageCleanup';
 import React, { useMemo, useState } from 'react';
 import {
   View,
   Text,
   FlatList,
   TouchableOpacity,
-  Platform,
 } from 'react-native';
+import { LIST_CLIPPING_PROPS } from '../constants/listClipping';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -198,7 +199,12 @@ export const ProjectChatsScreen: React.FC = () => {
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: () => deleteConversation(conversation.id),
+          onPress: async () => {
+            setAlertState(hideAlert());
+            const notDeleted = await deleteChatImages(conversation.id);
+            deleteConversation(conversation.id);
+            if (notDeleted > 0) setAlertState(imagesNotDeletedAlert(notDeleted));
+          },
         },
       ]
     ));
@@ -207,6 +213,8 @@ export const ProjectChatsScreen: React.FC = () => {
   const renderChatRightActions = (conversation: Conversation) => (
     <TouchableOpacity
       style={styles.deleteAction}
+      accessibilityRole="button"
+      accessibilityLabel={`Delete ${conversation.title}`}
       onPress={() => handleDeleteChat(conversation)}
     >
       <Icon name="trash-2" size={16} color={colors.error} />
@@ -251,7 +259,7 @@ export const ProjectChatsScreen: React.FC = () => {
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Back">
           <Icon name="arrow-left" size={20} color={colors.text} />
         </TouchableOpacity>
         <View style={styles.headerCenter}>
@@ -291,7 +299,7 @@ export const ProjectChatsScreen: React.FC = () => {
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
-          removeClippedSubviews={Platform.OS !== 'android'}
+          {...LIST_CLIPPING_PROPS}
         />
       )}
       <CustomAlert {...alertState} onClose={() => setAlertState(hideAlert())} />

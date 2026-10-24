@@ -4,7 +4,7 @@ import { ChatMessage } from '../../components';
 import { ThinkingIndicator } from '../../components/ThinkingIndicator';
 import { SPACING } from '../../constants';
 import { parseModelOutput, prepareMessageForSpeech } from '../../utils/messageContent';
-import { Message } from '../../types';
+import { DocumentCitation, Message } from '../../types';
 import { useChatStore, useUiModeStore } from '../../stores';
 import { getSlot, SLOTS } from '../../bootstrap/slotRegistry';
 import { ChatMessageItem } from './useChatScreen';
@@ -20,6 +20,7 @@ type MessageRendererProps = {
   showGenerationDetails: boolean;
   onCopy: (content: string) => void;
   onRetry: (message: Message) => void;
+  onSelectVersion?: (message: Message, direction: -1 | 1) => void;
   onEdit: (message: Message, newContent: string) => void;
   onTranscribeAgain?: (
     message: Message,
@@ -27,6 +28,7 @@ type MessageRendererProps = {
   ) => Promise<void>;
   onGenerateImage: (prompt: string) => void;
   onImagePress: (uri: string) => void;
+  onCitationPress?: (source: DocumentCitation) => void;
 };
 
 const MessageRendererInner: React.FC<MessageRendererProps> = props => {
@@ -41,10 +43,12 @@ const MessageRendererInner: React.FC<MessageRendererProps> = props => {
     showGenerationDetails,
     onCopy,
     onRetry,
+    onSelectVersion,
     onEdit,
     onTranscribeAgain,
     onGenerateImage,
     onImagePress,
+    onCitationPress,
   } = props;
 
   const interfaceMode = useUiModeStore(s => s.interfaceMode);
@@ -113,10 +117,12 @@ const MessageRendererInner: React.FC<MessageRendererProps> = props => {
       isStreaming={isStreamingThis}
       onCopy={onCopy}
       onRetry={onRetry}
+      onSelectVersion={onSelectVersion}
       onEdit={onEdit}
       onTranscribeAgain={onTranscribeAgain}
       onGenerateImage={onGenerateImage}
       onImagePress={onImagePress}
+      onCitationPress={onCitationPress}
       canGenerateImage={imageModelLoaded && !isStreaming && !isGeneratingImage}
       showGenerationDetails={showGenerationDetails}
       animateEntry={animateEntry}
